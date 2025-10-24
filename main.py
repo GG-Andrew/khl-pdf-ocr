@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query
-import pytesseract
 from pdf2image import convert_from_path
+import pytesseract
 import tempfile
 import requests
 import os
@@ -18,36 +18,40 @@ def ocr_parse(
     pdf_url: str = Query(...)
 ):
     """
-    Пример запроса:
+    Пример:
     /ocr?match_id=897678&pdf_url=https://www.khl.ru/pdf/1369/897678/game-897678-start-ru.pdf
     """
     try:
-        # скачиваем PDF
-        r = requests.get(pdf_url, timeout=20)
+        # скачиваем PDF с khl.ru (нужен referer, иначе 403)
+        headers = {"Referer": "https://www.khl.ru"}
+        r = requests.get(pdf_url, headers=headers, timeout=20)
         if r.status_code != 200:
-            return {"ok": False, "error": f"HTTP {r.status_code} при скачивании PDF"}
+            return {"ok": False, "step": "GET", "status": r.status_code}
 
-        # сохраняем во временный файл
+        # временный файл PDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(r.content)
             tmp_path = tmp.name
 
-        # конвертируем в изображения
+        # конвертация страниц в изображения
         pages = convert_from_path(tmp_path, dpi=200)
-        text_all = ""
+        text_full = ""
         for page in pages:
-            text = pytesseract.image_to_string(page, lang="rus+eng")
-            text_all += text + "\n"
+            text_full += pytesseract.image_to_string(page, lang="rus+eng") + "\n"
 
-        os.unlink(tmp_path)
+        os.remove(tmp_path)
 
-        # возвращаем результат
+        # чистим и упрощаем результат
+        lines = [l.strip() for l in text_full.splitlines() if l.strip()]
+        sample = "\n".join(lines[:30])
+
         return {
             "ok": True,
             "match_id": match_id,
-            "text_len": len(text_all),
-            "snippet": text_all[:400]
+            "pdf_len": len(r.content),
+            "text_len": len(text_full),
+            "snippet": sample
         }
 
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "step": "PARSE", "error": str(e)}
