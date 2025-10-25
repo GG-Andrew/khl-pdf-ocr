@@ -21,17 +21,27 @@ app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
 # ---------------------------- Константы / Настройки ----------------------------
 
 DEFAULT_SEASON = 1369  # можно поменять при деплое
+# ===== PATCH A: HEADERS + PDF_TEMPLATES =====
 HEADERS = {
     "Referer": "https://www.khl.ru/online/",
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/pdf,*/*;q=0.9",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
-# порядок важен: сначала используем пришедший url, затем шаблон pdf, затем documents
+
 PDF_TEMPLATES = [
-    "{pdf_url}",
+    "{pdf_url}",  # как прислали
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-ru.pdf",
+    "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start.pdf",
+    "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-en.pdf",
+    "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-protocol-ru.pdf",
+    "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-official-ru.pdf",
+    "https://khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-ru.pdf",
     "https://www.khl.ru/documents/{season}/{match_id}.pdf",
 ]
+
 
 # Грубые паттерны для извлечения блоков
 SECTION_PATTERNS = {
@@ -104,26 +114,39 @@ def ocr_images(images: List[Image.Image], lang: str = "rus+eng") -> str:
         blocks.append(pytesseract.image_to_string(im, lang=lang, config=cfg))
     return "\n".join(blocks)
 
-async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> Tuple[Optional[bytes], Optional[str], List[str]]:
-    """Скачивает PDF, пробуя несколько шаблонов URL. Возвращает (bytes, final_url, tried_urls)."""
-    tried: List[str] = []
+# ===== PATCH B: fetch_pdf_with_fallback =====
+import httpx
+
+async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int):
+    tried = []
     params = {"pdf_url": (pdf_url or "").strip(), "match_id": match_id, "season": season}
-    # быстрая подмена, если пришёл documents-ссылкой
+
+    # автоподмена documents -> pdf, если прислали documents-ссылку
     if "khl.ru/documents/" in params["pdf_url"] and "/pdf/" not in params["pdf_url"]:
         params["pdf_url"] = f"https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-ru.pdf"
 
-    timeout = httpx.Timeout(20.0)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+    timeout = httpx.Timeout(25.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=HEADERS) as client:
+        # прогрев сессии (cookies), иначе KHL может отдавать 404
+        try:
+            await client.get("https://www.khl.ru/", headers=HEADERS)
+        except Exception:
+            pass
+
         for tpl in PDF_TEMPLATES:
             url = tpl.format(**params).strip()
             if not url or url in tried:
                 continue
             tried.append(url)
-            r = await client.get(url, headers=HEADERS)
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-                return r.content, url, tried
+            try:
+                r = await client.get(url, headers=HEADERS)
+                if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
+                    return r.content, url, tried
+            except Exception:
+                continue
 
     return None, None, tried
+
 
 def extract_block(text: str, key: str) -> str:
     pat = SECTION_PATTERNS[key]
