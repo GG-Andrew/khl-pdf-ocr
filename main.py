@@ -1,8 +1,9 @@
 # main.py
-# KHL PDF OCR Server — v1.2.0
+# KHL PDF OCR Server — v1.2.1 (robust errors)
 # - /          : health
-# - /ocr       : OCR PDF с авто-фолбэком URL (documents -> pdf), прогревом cookies и «браузерными» заголовками
-# - /extract   : черновая структура (refs[], goalies{home,away}, lineups_raw) + нормализация кириллицы/ФИО
+# - /ocr       : OCR PDF с авто-фолбэком URL, прогревом cookies, «браузерными» заголовками
+# - /extract   : черновая структура (refs[], goalies{home,away}, lineups_raw)
+# При любой ошибке возвращаем JSON {"ok": false, "step": "...","error":"..."} вместо 500.
 
 import re
 import time
@@ -15,7 +16,7 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_SEASON = 1369
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
@@ -36,7 +37,7 @@ HEADERS = {
 }
 
 PDF_TEMPLATES = [
-    "{pdf_url}",  # как прислали
+    "{pdf_url}",
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-ru.pdf",
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start.pdf",
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-en.pdf",
@@ -68,10 +69,8 @@ def normalize_cyrillic(text: str) -> str:
     if not text:
         return text
     s = text.translate(LAT_TO_CYR)
-    # "БелоусовГеоргий" -> "Белоусов Георгий"
-    s = re.sub(r"([А-ЯЁ][а-яё]{2,})([А-ЯЁ][а-яё]{2,})", r"\1 \2", s)
-    # "ФамилияИ." -> "Фамилия И."
-    s = re.sub(r"([А-ЯЁ][а-яё]+)([А-ЯЁ]\.)", r"\1 \2", s)
+    s = re.sub(r"([А-ЯЁ][а-яё]{2,})([А-ЯЁ][а-яё]{2,})", r"\1 \2", s)  # "БелоусовГеоргий" -> "Белоусов Георгий"
+    s = re.sub(r"([А-ЯЁ][а-яё]+)([А-ЯЁ]\.)", r"\1 \2", s)              # "ФамилияИ." -> "Фамилия И."
     for pat, repl in COMMON_FIXES:
         s = re.sub(pat, repl, s)
     s = re.sub(r"[ \t]+", " ", s)
@@ -98,27 +97,26 @@ def ocr_images(images: List, lang: str = "rus+eng") -> str:
 
 # ---------------------------- Скачивание PDF (с прогревом) ----------------------------
 
-async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> Tuple[Optional[bytes], Optional[str], List[str]]:
+async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> Tuple[Optional[bytes], Optional[str], List[str], Optional[str]]:
     tried: List[str] = []
     params = {"pdf_url": (pdf_url or "").strip(), "match_id": match_id, "season": season}
     if "khl.ru/documents/" in params["pdf_url"] and "/pdf/" not in params["pdf_url"]:
         params["pdf_url"] = f"https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-ru.pdf"
 
+    last_error: Optional[str] = None
     timeout = httpx.Timeout(25.0)
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=timeout,
-        headers=HEADERS,
-        http2=True
+        headers=HEADERS
     ) as client:
-        # прогрев куков — главная и страница матча
+        # прогрев куков
         try:
             await client.get("https://www.khl.ru/", headers=HEADERS)
             await client.get(f"https://www.khl.ru/game/{match_id}/", headers=HEADERS)
-        except Exception:
-            pass
+        except Exception as e:
+            last_error = f"warmup:{e}"
 
-        # основная серия попыток
         for tpl in PDF_TEMPLATES:
             url = tpl.format(**params).strip()
             if not url or url in tried:
@@ -129,11 +127,13 @@ async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> T
             try:
                 r = await client.get(url, headers=local_headers)
                 if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-                    return r.content, url, tried
-            except Exception:
-                continue
+                    return r.content, url, tried, None
+                else:
+                    last_error = f"status:{r.status_code} ct:{r.headers.get('content-type','')}"
+            except Exception as e:
+                last_error = f"get:{type(e).__name__}:{e}"
 
-        # последний шанс — «облегчённые» заголовки
+        # облегчённые заголовки
         for url in list(tried):
             try:
                 r = await client.get(url, headers={
@@ -141,11 +141,13 @@ async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> T
                     "Referer": f"https://www.khl.ru/game/{match_id}/"
                 })
                 if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-                    return r.content, url, tried
-            except Exception:
-                continue
+                    return r.content, url, tried, None
+                else:
+                    last_error = f"fallback_status:{r.status_code}"
+            except Exception as e:
+                last_error = f"fallback_get:{type(e).__name__}:{e}"
 
-    return None, None, tried
+    return None, None, tried, last_error
 
 # ---------------------------- Вспомогательные парсеры ----------------------------
 
@@ -200,7 +202,6 @@ def parse_goalies(block: str) -> Dict[str, List[Dict[str, str]]]:
             nm = m.group(0).strip()
             if len(nm) >= 5:
                 found.append({"name": nm})
-        # дедуп и ограничение до 3
         seen, uniq = set(), []
         for f in found:
             if f["name"] in seen:
@@ -229,6 +230,7 @@ class OCRResponse(BaseModel):
     step: Optional[str] = None
     status: Optional[int] = None
     tried: Optional[List[str]] = None
+    error: Optional[str] = None
 
 # ---------------------------- Эндпойнты ----------------------------
 
@@ -247,35 +249,38 @@ async def ocr_parse(
     bin_thresh: int = Query(185, ge=120, le=230, description="Порог бинаризации 0-255"),
 ):
     t0 = time.time()
-    pdf_bytes, final_url, tried = await fetch_pdf_with_fallback(pdf_url, match_id, season)
-    if not pdf_bytes:
-        return OCRResponse(ok=False, step="GET", status=404, match_id=match_id, season=season, tried=tried)
+    try:
+        pdf_bytes, final_url, tried, last_err = await fetch_pdf_with_fallback(pdf_url, match_id, season)
+        if not pdf_bytes:
+            return OCRResponse(ok=False, step="GET", status=404, match_id=match_id, season=season, tried=tried, error=last_err)
 
-    t_pdf = time.time()
-    pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
-    proc = [preprocess(p, scale=scale, bin_thresh=bin_thresh) for p in pages]
-    t_pre = time.time()
+        t_pdf = time.time()
+        pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
+        proc = [preprocess(p, scale=scale, bin_thresh=bin_thresh) for p in pages]
+        t_pre = time.time()
 
-    raw_text = ocr_images(proc, lang="rus+eng")
-    text = normalize_cyrillic(raw_text)
-    t_ocr = time.time()
+        raw_text = ocr_images(proc, lang="rus+eng")
+        text = normalize_cyrillic(raw_text)
+        t_ocr = time.time()
 
-    snippet = re.sub(r"\s+", " ", text.strip())[:480]
-    return OCRResponse(
-        ok=True,
-        match_id=match_id,
-        season=season,
-        source_pdf=final_url,
-        pdf_len=len(pdf_bytes),
-        dpi=dpi,
-        pages_ocr=len(proc),
-        dur_total_s=round(t_ocr - t0, 3),
-        dur_download_s=round(t_pdf - t0, 3),
-        dur_preproc_s=round(t_pre - t_pdf, 3),
-        dur_ocr_s=round(t_ocr - t_pre, 3),
-        text_len=len(text),
-        snippet=snippet,
-    )
+        snippet = re.sub(r"\s+", " ", text.strip())[:480]
+        return OCRResponse(
+            ok=True,
+            match_id=match_id,
+            season=season,
+            source_pdf=final_url,
+            pdf_len=len(pdf_bytes),
+            dpi=dpi,
+            pages_ocr=len(proc),
+            dur_total_s=round(t_ocr - t0, 3),
+            dur_download_s=round(t_pdf - t0, 3),
+            dur_preproc_s=round(t_pre - t_pdf, 3),
+            dur_ocr_s=round(t_ocr - t_pre, 3),
+            text_len=len(text),
+            snippet=snippet,
+        )
+    except Exception as e:
+        return OCRResponse(ok=False, step="OCR", status=500, match_id=match_id, season=season, error=f"{type(e).__name__}: {e}")
 
 @app.get("/extract")
 async def extract_structured(
@@ -289,34 +294,37 @@ async def extract_structured(
     target: str = Query("all", description="refs|goalies|lineups|all"),
 ):
     t0 = time.time()
-    pdf_bytes, final_url, tried = await fetch_pdf_with_fallback(pdf_url, match_id, season)
-    if not pdf_bytes:
-        return {"ok": False, "step": "GET", "status": 404, "match_id": match_id, "season": season, "tried": tried}
+    try:
+        pdf_bytes, final_url, tried, last_err = await fetch_pdf_with_fallback(pdf_url, match_id, season)
+        if not pdf_bytes:
+            return {"ok": False, "step": "GET", "status": 404, "match_id": match_id, "season": season, "tried": tried, "error": last_err}
 
-    pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
-    proc = [preprocess(p, scale=scale, bin_thresh=bin_thresh) for p in pages]
-    raw_text = ocr_images(proc, lang="rus+eng")
-    text = normalize_cyrillic(raw_text)
+        pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
+        proc = [preprocess(p, scale=scale, bin_thresh=bin_thresh) for p in pages]
+        raw_text = ocr_images(proc, lang="rus+eng")
+        text = normalize_cyrillic(raw_text)
 
-    keys = ["refs", "goalies", "lineups"] if target == "all" else [target]
-    data: Dict[str, object] = {}
-    for k in keys:
-        blk = extract_block(text, k)
-        if k == "refs":
-            data["refs"] = parse_referees(blk)
-        elif k == "goalies":
-            data["goalies"] = parse_goalies(blk)
-        elif k == "lineups":
-            data["lineups_raw"] = blk
+        keys = ["refs", "goalies", "lineups"] if target == "all" else [target]
+        data: Dict[str, object] = {}
+        for k in keys:
+            blk = extract_block(text, k)
+            if k == "refs":
+                data["refs"] = parse_referees(blk)
+            elif k == "goalies":
+                data["goalies"] = parse_goalies(blk)
+            elif k == "lineups":
+                data["lineups_raw"] = blk
 
-    return {
-        "ok": True,
-        "match_id": match_id,
-        "season": season,
-        "source_pdf": final_url,
-        "dpi": dpi,
-        "pages_ocr": len(proc),
-        "dur_total_s": round(time.time() - t0, 3),
-        "text_len": len(text),
-        "data": data,
-    }
+        return {
+            "ok": True,
+            "match_id": match_id,
+            "season": season,
+            "source_pdf": final_url,
+            "dpi": dpi,
+            "pages_ocr": len(proc),
+            "dur_total_s": round(time.time() - t0, 3),
+            "text_len": len(text),
+            "data": data,
+        }
+    except Exception as e:
+        return {"ok": False, "step": "EXTRACT", "status": 500, "match_id": match_id, "season": season, "error": f"{type(e).__name__}: {e}"}
