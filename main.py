@@ -53,7 +53,7 @@ def _norm_txt(s: str) -> str:
     s = s.replace("й", "й").replace("Й", "Й").replace("ё", "е").replace("Ё", "Е")
     return re.sub(r"\s+", " ", s).strip()
 
-def words_to_lines(words, y_tol=3.0) -> List[str]:
+def words_to_lines(words, y_tol=7.5):
     lines, cur, last_y = [], [], None
     for w in words:
         y = w[1]
@@ -73,25 +73,25 @@ def words_to_lines(words, y_tol=3.0) -> List[str]:
             lines.append(t)
     return lines
 
-def split_two_columns(words):
+
+def split_two_columns(words, page_w: float):
     if not words:
         return [], []
-    xs = sorted(((w[0] + w[2]) / 2.0) for w in words)
-    mid = median(xs)
-    left = [w for w in words if ((w[0] + w[2]) / 2.0) <= mid]
-    right = [w for w in words if ((w[0] + w[2]) / 2.0) > mid]
-    if len(left) < 10 or len(right) < 10:
-        page_w = max(w[2] for w in words)
-        cut = page_w * 0.5
-        left = [w for w in words if ((w[0] + w[2]) / 2.0) <= cut]
-        right = [w for w in words if ((w[0] + w[2]) / 2.0) > cut]
+    cut = page_w * 0.5
+    left  = [w for w in words if ((w[0]+w[2])/2.0) <= cut]
+    right = [w for w in words if ((w[0]+w[2])/2.0) >  cut]
     left.sort(key=lambda w: (w[1], w[0]))
     right.sort(key=lambda w: (w[1], w[0]))
     return left, right
 
+
 ROSTER_ROW_RE = re.compile(
-    r"^(?P<num>\d{1,3})\s+(?P<pos>[ВЗН])\s+(?P<name>[A-ЯЁA-Za-z\-’'\.]+(?:\s+[A-ЯЁA-Za-z\-’'\.]+){0,3})\s+(?P<dob>\d{2}\.\d{2}\.\d{4})\s+(?P<age>\d{1,2})(?:\s+(?P<flag>[SR]))?$"
+    r"^(?P<num>\d{1,3})\s+(?P<pos>[ВЗН])\s+(?P<name>[^*0-9]+?(?:\s+[A-ЯЁA-Za-z\-’'\.]+){0,3})"
+    r"(?:\s+(?P<capt>[AKКА]))?"
+    r"(?:\s+(?P<dob>\d{2}\.\d{2}\.\d{4})\s+(?P<age>\d{1,2}))?"
+    r"(?:\s+(?P<flag>[SRСР]))?\s*$"
 )
+
 
 def parse_roster_lines(lines: List[str], side: str):
     out = []
@@ -102,19 +102,23 @@ def parse_roster_lines(lines: List[str], side: str):
             continue
         d = m.groupdict()
         flag = (d.get("flag") or "").upper()
+        flag = {"С":"S","Р":"R"}.get(flag, flag)  # кириллица -> латиница
         status = "starter" if flag == "S" else ("reserve" if flag == "R" else None)
+        capt = (d.get("capt") or "").upper()
+        capt = {"K":"K","A":"A","К":"K","А":"A"}.get(capt, "")
         out.append({
             "side": side,
             "num": d["num"],
             "pos": d["pos"],
             "name": d["name"].strip().strip("*"),
-            "capt": "",
-            "dob": d["dob"],
-            "age": d["age"],
+            "capt": capt,
+            "dob": d.get("dob") or "",
+            "age": d.get("age") or "",
             "gk_flag": flag,
             "gk_status": status,
         })
     return out
+
 
 REFS_BLOCK_RE = re.compile(r"(Судьи|Судейская бригада)(.*?)(\n\n|$)", re.S | re.I)
 REF_LINE_RE = re.compile(
@@ -160,9 +164,12 @@ def collect_goalies(roster: List[Dict[str, Any]]):
     res = []
     for it in roster:
         if it["pos"] == "В":
-            st = it["gk_status"] or ("starter" if it["gk_flag"] == "S" else ("reserve" if it["gk_flag"] == "R" else "unknown"))
+            st = it["gk_status"]
+            if not st:
+                st = "starter" if it["gk_flag"] == "S" else ("reserve" if it["gk_flag"] == "R" else "unknown")
             res.append({"name": it["name"], "status": st})
     return res
+
 
 # =========================
 #  ЗАГРУЗКА PDF + FALLBACK
@@ -203,14 +210,11 @@ async def fetch_pdf(match_id: int, season: int, pdf_url: Optional[str] = None):
 def parse_all_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    # 1) refs из целого текста
-    full_text = []
-    for i in range(len(doc)):
-        full_text.append(doc.load_page(i).get_text())
-    full_text = "\n".join(full_text)
+    # refs — по всему тексту
+    full_text = "\n".join(doc.load_page(i).get_text() for i in range(len(doc)))
     refs = extract_refs_from_text(full_text)
 
-    # 2) составы из первой "составной" страницы
+    # страница составов
     page_idx = 0
     for i in range(len(doc)):
         t = _norm_txt(doc.load_page(i).get_text())
@@ -219,16 +223,29 @@ def parse_all_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
             break
 
     p = doc.load_page(page_idx)
-    words = p.get_text("words")  # (x0,y0,x1,y1,word,block_no,line_no,word_no)
-    left, right = split_two_columns(words)
-    left_lines = words_to_lines(left)
-    right_lines = words_to_lines(right)
+    page_w, page_h = p.rect.width, p.rect.height
 
+    # 1-й проход: слова -> строки
+    words = p.get_text("words")
+    left_w, right_w = split_two_columns(words, page_w)
+    left_lines = words_to_lines(left_w)
+    right_lines = words_to_lines(right_w)
     home = parse_roster_lines(left_lines, "home")
     away = parse_roster_lines(right_lines, "away")
 
+    # fallback: если «игроков» мало — режем прямоугольниками и парсим построчно
+    if len(home) + len(away) < 10:
+        cut = page_w * 0.5
+        left_txt  = p.get_text("text", clip=fitz.Rect(0, 0, cut, page_h))
+        right_txt = p.get_text("text", clip=fitz.Rect(cut, 0, page_w, page_h))
+        def lines_from_text(s: str) -> List[str]:
+            return [ _norm_txt(x) for x in s.splitlines() if _norm_txt(x) ]
+        home = parse_roster_lines(lines_from_text(left_txt),  "home")
+        away = parse_roster_lines(lines_from_text(right_txt), "away")
+
     goalies = {"home": collect_goalies(home), "away": collect_goalies(away)}
     return {"refs": refs, "goalies": goalies, "lineups": {"home": home, "away": away}}
+
 
 def parse_all_from_text(txt: str) -> Dict[str, Any]:
     t = _norm_txt(txt)
