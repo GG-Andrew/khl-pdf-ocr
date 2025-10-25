@@ -44,8 +44,12 @@ DEFAULT_SEASON = 1369
 
 HEADERS = {
     "Referer": "https://www.khl.ru/online/",
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/pdf,*/*;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "close",
 }
 
 PDF_TEMPLATES = [
@@ -83,21 +87,50 @@ _dict_players = _load_csv_set(PLAYERS_CSV)
 _dict_refs = _load_csv_set(REFEREES_CSV)
 
 # -------------------- УТИЛЫ ------------------------------
-def http_get(url: str, timeout: float = 20.0) -> Tuple[int, bytes]:
-    # пробуем httpx, затем urllib
-    try:
-        import httpx
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers=HEADERS) as c:
-            r = c.get(url)
-            return r.status_code, r.content
-    except Exception:
+def http_get(url: str, timeout: float = 25.0) -> Tuple[int, bytes]:
+    # несколько «профилей» заголовков, чтобы пробить антибот
+    UA_POOL = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ]
+    BASE = {
+        "Referer": "https://www.khl.ru/online/",
+        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "close",
+    }
+
+    # 3 попытки * 3 профиля = до 9 проб
+    tries = []
+    for ua in UA_POOL:
+        hdrs = BASE.copy()
+        hdrs["User-Agent"] = ua
+        # 1) httpx (HTTP/2)
+        try:
+            import httpx, random, time as _t
+            with httpx.Client(follow_redirects=True, timeout=timeout, headers=hdrs, http2=True) as c:
+                r = c.get(url)
+                tries.append(("httpx", r.status_code))
+                if r.status_code == 200:
+                    return 200, r.content
+                # небольшой джиттер перед повтором
+                _t.sleep(0.6 + random.random() * 0.6)
+        except Exception:
+            pass
+        # 2) urllib (жёстко HTTP/1.1)
         try:
             from urllib.request import Request, urlopen
-            req = Request(url, headers=HEADERS)
+            req = Request(url, headers=hdrs)
             with urlopen(req, timeout=timeout) as resp:
-                return 200, resp.read()
+                data = resp.read()
+                return 200, data
         except Exception:
-            return 0, b""
+            continue
+    return 0, b""
+
 
 def fetch_pdf_with_fallback(match_id: int, season: int, pdf_url: Optional[str]) -> Tuple[Optional[bytes], List[str]]:
     tried = []
