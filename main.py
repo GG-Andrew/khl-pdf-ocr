@@ -1,304 +1,329 @@
-import sys
-import unicodedata
-from typing import Dict, List, Tuple, Any
+# main.py
+# khl-pdf-ocr — колонковый парсер стартовых протоколов КХЛ
+# Стек: FastAPI + httpx + PyMuPDF (fitz) + regex (+ rapidfuzz для нормализации, по возможности)
+
+from __future__ import annotations
+
+import io
+import os
+import re
+import json
+import asyncio
+from typing import List, Dict, Tuple, Optional
 
 import httpx
 import fitz  # PyMuPDF
-import regex as re
 from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="KHL PDF OCR Server", version="3.0.0")
+# --- опционально: фуззи нормализация по CSV, если rapidfuzz доступен ---
+try:
+    from rapidfuzz import process, fuzz  # type: ignore
+    HAVE_FUZZ = True
+except Exception:
+    HAVE_FUZZ = False
 
-# =========================
-# НОРМАЛИЗАЦИЯ ТЕКСТА
-# =========================
-_ACCENT_TABLE = dict.fromkeys(
-    c for c in range(sys.maxunicode)
-    if unicodedata.category(chr(c)) == "Mn"
+
+APP_VERSION = "3.0.0"
+app = FastAPI(title="KHL PDF OCR (column parser)", version=APP_VERSION)
+
+# -----------------------------
+# Глобальные словари (опционально)
+# -----------------------------
+PLAYERS_CSV = os.getenv("PLAYERS_CSV", "players.csv")
+REFEREES_CSV = os.getenv("REFEREES_CSV", "referees.csv")
+
+PLAYERS_LIST: List[str] = []
+REFS_LIST: List[str] = []
+
+def _load_list(path: str) -> List[str]:
+    if not os.path.exists(path):
+        return []
+    vals: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            t = line.strip().strip(",;")
+            if t:
+                vals.append(t)
+    return vals
+
+def load_dicts() -> None:
+    global PLAYERS_LIST, REFS_LIST
+    PLAYERS_LIST = _load_list(PLAYERS_CSV)
+    REFS_LIST = _load_list(REFEREES_CSV)
+
+load_dicts()
+
+def fuzzy_name(name: str, pool: List[str], cutoff: int = 90) -> str:
+    """Возвращает лучший матч из справочника, если rapidfuzz доступен и сходство высокое."""
+    if not HAVE_FUZZ or not pool:
+        return name
+    cand = process.extractOne(name, pool, scorer=fuzz.token_set_ratio)
+    if cand and cand[1] >= cutoff:
+        return cand[0]
+    return name
+
+# -----------------------------
+# Вспомогательные нормализации
+# -----------------------------
+SPACE_RE = re.compile(r"[ \t\u00A0]+")
+def norm_spaces(s: str) -> str:
+    return SPACE_RE.sub(" ", s).strip()
+
+CAPT_RE = re.compile(r"\b([AKАК])\b\.?$", re.IGNORECASE)
+def split_capt(s: str) -> Tuple[str, str]:
+    """Выделяем литеру капитана в конце имени ('К'/'A'). Возвращаем (name, capt)."""
+    s = norm_spaces(s)
+    m = CAPT_RE.search(s)
+    if m:
+        return norm_spaces(CAPT_RE.sub("", s)), m.group(1).upper().replace("К", "K").replace("А", "A")
+    return s, ""
+
+GK_FLAG_RE = re.compile(r"\b([СР])\b\.?$", re.IGNORECASE)  # S/R по рус. верстке часто 'С'/'Р'
+def split_gk_flag(name: str) -> Tuple[str, Optional[str]]:
+    n = norm_spaces(name)
+    m = GK_FLAG_RE.search(n)
+    if m:
+        flag = m.group(1).upper()
+        flag = "S" if flag == "С" else "R"  # русские буквы
+        return norm_spaces(GK_FLAG_RE.sub("", n)), flag
+    return n, None
+
+def gk_status_from_flag(flag: Optional[str]) -> Optional[str]:
+    if flag == "S":
+        return "starter"
+    if flag == "R":
+        return "reserve"
+    return None
+
+# -----------------------------
+# Загрузка PDF и резка по колонкам
+# -----------------------------
+async def fetch_pdf_bytes(url: str, timeout: float = 25.0) -> bytes:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/pdf,*/*;q=0.9",
+        "Referer": "https://www.khl.ru/",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, http2=True) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.content
+
+def read_pdf_columns(pdf_bytes: bytes) -> Tuple[str, str]:
+    """Возвращает (left_text, right_text) для 1-й страницы PDF.
+    Деление по x-координатам блоков (надёжнее маркеров)."""
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count < 1:
+            return "", ""
+        page = doc[0]
+        blocks = page.get_text("blocks")  # (x0,y0,x1,y1,text, block_no, ...)
+        W = float(page.rect.width)
+        mid = W / 2.0
+
+        left_blocks: List[Tuple[float, str]] = []
+        right_blocks: List[Tuple[float, str]] = []
+
+        for b in blocks:
+            x0, y0, x1, y1, txt = float(b[0]), float(b[1]), float(b[2]), float(b[3]), str(b[4])
+            if not txt or not txt.strip():
+                continue
+            # Строгое разнесение по колонкам
+            if x1 <= mid - 8:
+                left_blocks.append((y0, txt))
+            elif x0 >= mid + 8:
+                right_blocks.append((y0, txt))
+            else:
+                # Попали в «щель» — отправляем по центру
+                cx = (x0 + x1) / 2.0
+                (left_blocks if cx < mid else right_blocks).append((y0, txt))
+
+        left_text = "\n".join(t for _, t in sorted(left_blocks, key=lambda z: z[0]))
+        right_text = "\n".join(t for _, t in sorted(right_blocks, key=lambda z: z[0]))
+        return left_text, right_text
+
+# -----------------------------
+# Парсеры
+# -----------------------------
+
+# 1) Судьи
+REFS_BLOCK_RE = re.compile(r"(Главный судья|Линейный судья)[^\n]*", re.IGNORECASE)
+NAME_TOKENS_RE = re.compile(r"[A-Za-zА-Яа-яЁё\.\-ʼ’`]+")
+def parse_refs(side_text: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for line in side_text.splitlines():
+        line = norm_spaces(line)
+        if not line:
+            continue
+        if "Главный судья" in line or "Линейный судья" in line:
+            role = "Главный судья" if "Главный судья" in line else "Линейный судья"
+            # имена могут быть на соседних строках — соберём токены
+            tokens = NAME_TOKENS_RE.findall(line)
+            # Уберём слова роли
+            tokens = [t for t in tokens if t.lower() not in ("главный", "судья", "линейный")]
+            if len(tokens) >= 2:
+                # обычно "Фамилия Имя"
+                name = f"{tokens[0]} {tokens[1]}"
+                name = fuzzy_name(name, REFS_LIST)
+                out.append({"role": role, "name": name})
+    return out
+
+def dedup_refs(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen = set()
+    res = []
+    for r in items:
+        key = (r.get("role", ""), r.get("name", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        res.append(r)
+    return res
+
+# 2) Вратари
+GOALIES_SECTION_RE = re.compile(r"Вратари(.+?)(?:Звено|Главный тренер|Линейный|Главный судья|---RIGHT---|$)", re.IGNORECASE | re.DOTALL)
+# варианты строки: "60 В Бочаров Иван С 18.05.1995 30"
+GK_LINE_RE = re.compile(
+    r"^\s*(\d{1,2})\s+В\b[^\n]*?\b([A-Za-zА-Яа-яЁё\. \-ʼ’`]+?)(?:\s+([СР]))?\s+(?:\d{2}\.\d{2}\.\d{4})",
+    re.MULTILINE
 )
 
-def _strip_accents(s: str) -> str:
-    # NFKD -> убираем диакритику -> NFC
-    return unicodedata.normalize("NFC", unicodedata.normalize("NFKD", s).translate(_ACCENT_TABLE))
+def parse_goalies(side_text: str, side: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    m = GOALIES_SECTION_RE.search(side_text)
+    if not m:
+        return out
+    sec = m.group(1)
 
-def _latin_lookalikes_to_cyr(s: str) -> str:
-    # Минимально нужные замены латиницы на визуально близкие кирсимволы
-    return (s.replace("A","А").replace("a","а")
-             .replace("B","В").replace("E","Е").replace("e","е")
-             .replace("K","К").replace("M","М").replace("H","Н")
-             .replace("O","О").replace("o","о").replace("P","Р")
-             .replace("C","С").replace("c","с").replace("T","Т")
-             .replace("X","Х"))
-
-def normalize_khl_text(s: str) -> str:
-    if not s:
-        return s
-    s = _strip_accents(s)
-    s = s.replace("Ё", "Е").replace("ё", "е")
-    s = _latin_lookalikes_to_cyr(s)
-    # выравниваем вертикальные разделители
-    s = re.sub(r"[ \t]*\|[ \t]*", " | ", s)
-    # схлопываем пробелы
-    s = re.sub(r"[^\S\r\n]+", " ", s)
-    s = re.sub(r"\s{2,}", " ", s)
-    # аккуратнее с переносами: оставим явные блоки
-    s = s.replace("\r", "")
-    return s.strip()
-
-# =========================
-# ЗАГРУЗКА PDF
-# =========================
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-       "AppleWebKit/537.36 (KHTML, like Gecko) "
-       "Chrome/127.0 Safari/537.36")
-
-def fetch_pdf_bytes(url: str) -> Tuple[bytes, List[str], int]:
-    tried: List[str] = []
-    code = 0
-    headers = {
-        "User-Agent": _UA,
-        "Referer": "https://www.khl.ru/",
-        "Accept": "application/pdf,application/*;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru,en;q=0.9",
-        "Connection": "keep-alive",
-    }
-    variants = [url]
-    if "www.khl.ru" in url:
-        variants.append(url.replace("www.khl.ru", "khl.ru"))
-    if url.endswith("-start-ru.pdf"):
-        variants.extend([
-            url.replace("-start-ru.pdf", "-start.pdf"),
-            url.replace("-start-ru.pdf", "-start-en.pdf"),
-            url.replace("-start-ru.pdf", "-protocol-ru.pdf"),
-            url.replace("-start-ru.pdf", "-official-ru.pdf"),
-        ])
-    # на всякий случай http
-    if url.startswith("https://"):
-        variants.append(url.replace("https://", "http://"))
-
-    try:
-        # ВАЖНО: http2=False, чтобы не требовать пакет h2
-        with httpx.Client(http2=False, timeout=30.0, headers=headers, follow_redirects=True) as client:
-            for v in variants:
-                r = client.get(v)
-                code = r.status_code
-                tried.append(f"{v} [{code}]")
-                if code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-                    return r.content, tried, 200
-    except Exception as e:
-        tried.append(f"httpx err: {e!r}")
-        return b"", tried, 599
-
-    return b"", tried, code or 520
-
-# =========================
-# ТЕКСТ ИЗ PDF (первая страница)
-# =========================
-def text_from_pdf_first_page(pdf: bytes) -> str:
-    doc = fitz.open(stream=pdf, filetype="pdf")
-    if doc.page_count == 0:
-        return ""
-    page = doc[0]
-    # sort=True для стабильного порядка строк
-    return page.get_text("text", sort=True) or ""
-
-# =========================
-# ПАРСЕРЫ
-# =========================
-def parse_refs(t: str) -> List[Dict[str, str]]:
-    refs: List[Dict[str, str]] = []
-
-    # Главные судьи
-    for m in re.finditer(r"(Главный судья)\s+([А-ЯЁA-Z][а-яёa-z]+)\s+([А-ЯЁA-Z][а-яёa-z]+)", t):
-        refs.append({"role": m.group(1), "name": f"{m.group(2)} {m.group(3)}"})
-    # Линейные судьи
-    for m in re.finditer(r"(Линейный судья)\s+([А-ЯЁA-Z][а-яёa-z]+)\s+([А-ЯЁA-Z][а-яёa-z]+)", t):
-        refs.append({"role": m.group(1), "name": f"{m.group(2)} {m.group(3)}"})
-
-    # Удалим дубликаты, сохраняя порядок
-    seen = set()
-    uniq = []
-    for r in refs:
-        key = (r["role"], r["name"])
-        if key not in seen:
-            seen.add(key)
-            uniq.append(r)
-    return uniq
-
-def parse_goalies(t: str) -> Dict[str, List[Dict[str, str]]]:
-    out = {"home": [], "away": []}
-
-    # Грубое деление на левую/правую части.
-    # Часто в текст-слое есть "---RIGHT---". Если нет — попробуем расколоть по словам типа названия второй команды.
-    parts = re.split(r"\n+---RIGHT---\n+", t)
-    if len(parts) == 1:
-        parts = re.split(r"\nДИНАМО|^ДИНАМО| СПАРТАК| ЦСКА| СКА| ЛОКОМОТИВ| АВАНГАРД| СИБИРЬ| СЕВЕРСТАЛЬ| АДМИРАЛ| АВТОМОБИЛИСТ| АК БАРС| АМУР| АТЛАНТ| БАРЫС| ВИТЯЗЬ| НЕФТЕХИМИК| МЕТАЛЛУРГ", t, maxsplit=1, flags=re.M)
-    left_text = parts[0]
-    right_text = parts[1] if len(parts) > 1 else ""
-
-    def grab(side_text: str, side: str):
-        # Вратари блок
-        blk = re.search(r"Вратари(.*?)(Звено|Главный тренер|Линейный судья|$)", side_text, flags=re.S)
-        if not blk:
-            return
-        chunk = blk.group(1)
-        # Формат с вертикалями: 60 | В | Фамилия Имя [С/Р]
-        for m in re.finditer(r"\b(\d{1,2})\s*(?:\|\s*)?В(?:\s*\|)?\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+)(?:\s+([СР]))?", chunk):
-            name = f"{m.group(2)} {m.group(3)}"
-            status = {"С": "starter", "Р": "reserve"}.get((m.group(4) or "").upper(), "scratch")
-            cand = {"name": name, "status": status}
-            if cand not in out[side]:
-                out[side].append(cand)
-
-    grab(left_text, "home")
-    grab(right_text, "away")
+    for mm in GK_LINE_RE.finditer(sec):
+        num = mm.group(1)
+        raw_name = norm_spaces(mm.group(2))
+        raw_name, flag = split_gk_flag(raw_name)
+        name = fuzzy_name(raw_name, PLAYERS_LIST)
+        status = gk_status_from_flag(flag) or "scratch"
+        out.append({"name": name, "status": status})
     return out
 
-def parse_lineups(t: str) -> Dict[str, List[Dict[str, Any]]]:
-    out = {"home": [], "away": []}
-    # Деляем на левую/правую колонку
-    parts = re.split(r"\n+---RIGHT---\n+", t)
-    if len(parts) == 1:
-        parts = re.split(r"\nДИНАМО|^ДИНАМО| СПАРТАК| ЦСКА| СКА| ЛОКОМОТИВ| АВАНГАРД| СИБИРЬ| СЕВЕРСТАЛЬ| АДМИРАЛ| АВТОМОБИЛИСТ| АК БАРС| АМУР| АТЛАНТ| БАРЫС| ВИТЯЗЬ| НЕФТЕХИМИК| МЕТАЛЛУРГ", t, maxsplit=1, flags=re.M)
-    left_text = parts[0]
-    right_text = parts[1] if len(parts) > 1 else ""
+# 3) Составы
+# Пример строки: "27 З Коттон Алекс 12.05.2001 24" или "18 Н Кугрышев Дмитрий К 18.01.1990 35"
+LINEUP_LINE_RE = re.compile(
+    r"^\s*(\d{1,2})\s+(В|З|Н)\s+([A-Za-zА-Яа-яЁё\. \-ʼ’`]+?)\s+(?:\d{2}\.\d{2}\.\d{4})",
+    re.MULTILINE
+)
 
-    row_re = re.compile(
-        r"\b(?P<num>\d{1,2})\s*(?:\|\s*)?(?P<pos>[ВЗН])(?:\s*\|)?\s+"
-        r"(?P<last>[А-ЯЁ][а-яё]+)\s+(?P<first>[А-ЯЁ][а-яё\.]+)"
-        r"(?:\s+(?P<capt>[АК]))?"
-        r"(?:\s*(?:\*\s*)?)"
-        r"(?:\s*(?P<dob>\d{2}\.\d{2}\.\d{4}))?"
-        r"(?:\s+(?P<age>\d{2}))?"
-    )
+def parse_lineups(side_text: str, side: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    # берём всё поле (после "Составы" вверху обычно колонки уже сформированы)
+    for mm in LINEUP_LINE_RE.finditer(side_text):
+        num, pos, raw_name = mm.group(1), mm.group(2), mm.group(3)
+        raw_name, gk_flag = split_gk_flag(raw_name)  # у полевых почти всегда None, но на вратарей сработает
+        name, capt = split_capt(raw_name)
+        name = fuzzy_name(name, PLAYERS_LIST)
 
-    def collect(side_text: str, side: str):
-        # ограничимся секциями Звено/Составы до "Главный тренер" — чтобы не ловить судей
-        msec = re.search(r"(Составы|Звено|Вратари)(.*?)(Главный тренер|Линейный судья|$)", side_text, flags=re.S)
-        body = msec.group(2) if msec else side_text
-        for m in row_re.finditer(body):
-            d = m.groupdict()
-            name = f"{d['last']} {d['first'].rstrip('.')}"
-            item: Dict[str, Any] = {
-                "side": side,
-                "num": d["num"],
-                "pos": d["pos"],
-                "name": name,
-                "capt": (d.get("capt") or "").upper(),
-            }
-            if d.get("dob"):
-                item["dob"] = d["dob"]
-            if d.get("age"):
-                item["age"] = d["age"]
-            if item["pos"] == "В":
-                # флаги киперов иногда прилипают к имени
-                if item["name"].endswith(" С"):
-                    item["gk_flag"] = "S"
-                    item["gk_status"] = "starter"
-                    item["name"] = item["name"][:-2]
-                elif item["name"].endswith(" Р"):
-                    item["gk_flag"] = "R"
-                    item["gk_status"] = "reserve"
-                    item["name"] = item["name"][:-2]
-            out[side].append(item)
-
-    collect(left_text, "home")
-    collect(right_text, "away")
+        item = {
+            "side": side,
+            "num": num,
+            "pos": pos,
+            "name": name,
+            "capt": capt,
+        }
+        # попробуем вытянуть DOB/возраст из хвоста строки
+        tail = side_text[mm.end():mm.end()+30]
+        mdate = re.search(r"\b(\d{2}\.\d{2}\.\d{4})\b(?:\s+(\d{1,2}))?", tail)
+        if mdate:
+            item["dob"] = mdate.group(1)
+            if mdate.group(2):
+                item["age"] = mdate.group(2)
+        # если это вратарь в «Составы» — отметим флаг
+        if pos == "В" and gk_flag:
+            item["gk_flag"] = gk_flag
+            item["gk_status"] = gk_status_from_flag(gk_flag)
+        out.append(item)
     return out
 
-# =========================
-# ЭНДПОИНТЫ
-# =========================
+# -----------------------------
+# API
+# -----------------------------
 @app.get("/")
-def root():
-    return {"ok": True, "service": "khl-pdf-ocr", "ready": True}
+async def root():
+    return {
+        "ok": True,
+        "service": "khl-pdf-ocr",
+        "version": APP_VERSION,
+        "ready": True,
+        "dicts": {
+            "players_csv": os.path.exists(PLAYERS_CSV),
+            "referees_csv": os.path.exists(REFEREES_CSV),
+            "players_loaded": len(PLAYERS_LIST),
+            "refs_loaded": len(REFS_LIST),
+        },
+    }
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 @app.get("/ocr")
-def ocr_parse(
-    match_id: int = Query(...),
+async def ocr_endpoint(
     pdf_url: str = Query(...),
-    dpi: int = Query(130, ge=120, le=360),
-    max_pages: int = Query(1, ge=1, le=5),
-    scale: float = Query(1.3, ge=1.0, le=2.0),
-    bin_thresh: int = Query(185, ge=120, le=230),
+    match_id: int = Query(...),
+    season: int = Query(...),
 ):
-    # Совместимый по форме ответ, но без OCR (используем текст-слой)
+    """Просто вернём текст (левая/правая колонка) — для отладки."""
     try:
-        pdf, tried, code = fetch_pdf_bytes(pdf_url)
-        if not pdf:
-            return {"ok": False, "match_id": match_id, "step": "GET", "status": code or 404, "tried": tried}
-        raw = text_from_pdf_first_page(pdf)
-        norm = normalize_khl_text(raw)
-        return {
-            "ok": True,
-            "match_id": match_id,
-            "pdf_len": len(pdf),
-            "dpi": dpi,
-            "pages_ocr": 1,
-            "dur_total_s": 0.0,
-            "dur_ocr_s": 0.0,
-            "text_len": len(norm),
-            "snippet": norm[:600],
-            "tried": tried,
-        }
+        pdf_bytes = await fetch_pdf_bytes(pdf_url)
     except Exception as e:
-        return {"ok": False, "match_id": match_id, "step": "OCR", "status": 500, "error": str(e)}
+        return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 599, "error": str(e)})
+
+    left, right = read_pdf_columns(pdf_bytes)
+    snippet = norm_spaces((left + "\n" + right)[:600])
+    return {
+        "ok": True,
+        "match_id": match_id,
+        "season": season,
+        "source_pdf": pdf_url,
+        "pdf_len": len(pdf_bytes),
+        "pages_ocr": 1,
+        "text_len": len(left) + len(right),
+        "snippet": snippet,
+    }
 
 @app.get("/extract")
-def extract(
-    match_id: int = Query(...),
+async def extract_endpoint(
     pdf_url: str = Query(...),
+    match_id: int = Query(...),
     season: int = Query(...),
-    target: str = Query("all")
+    target: str = Query("all", description="all|refs|goalies|lineups"),
 ):
+    """Основной парсер: режем PDF на 2 колонки и парсим блоки по-отдельности."""
     try:
-        pdf, tried, code = fetch_pdf_bytes(pdf_url)
-        if not pdf:
-            return {"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": code or 404, "tried": tried}
-
-        raw = text_from_pdf_first_page(pdf)
-        norm = normalize_khl_text(raw)
-
-        data: Dict[str, Any] = {}
-        if target in ("refs", "all"):
-            data["refs"] = parse_refs(norm)
-        if target in ("goalies", "all"):
-            data["goalies"] = parse_goalies(norm)
-        if target in ("lineups", "all"):
-            data["lineups"] = parse_lineups(norm)
-
-        return {
-            "ok": True,
-            "match_id": match_id,
-            "season": season,
-            "source_pdf": pdf_url,
-            "pdf_len": len(pdf),
-            "dpi": 130,
-            "pages_ocr": 1,
-            "dur_total_s": 0.0,
-            "data": data,
-            "tried": tried
-        }
+        pdf_bytes = await fetch_pdf_bytes(pdf_url)
     except Exception as e:
-        return {"ok": False, "match_id": match_id, "season": season, "step": "EXTRACT", "status": 500, "error": str(e)}
+        return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 599, "error": str(e)})
 
-@app.get("/debug_text")
-def debug_text(
-    match_id: int = Query(...),
-    pdf_url: str = Query(...),
-    season: int = Query(...)
-):
-    try:
-        pdf, tried, code = fetch_pdf_bytes(pdf_url)
-        if not pdf:
-            return {"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": code or 404, "tried": tried}
-        raw = text_from_pdf_first_page(pdf)
-        norm = normalize_khl_text(raw)
-        markers = {
-            "has_vratari": ("Вратари" in norm),
-            "has_zveno": ("Звено" in norm or "Составы" in norm),
-            "has_refs": ("Главный судья" in norm or "Линейный судья" in norm),
+    left, right = read_pdf_columns(pdf_bytes)
+
+    data: Dict[str, object] = {}
+    if target in ("all", "refs"):
+        r = dedup_refs(parse_refs(left) + parse_refs(right))
+        data["refs"] = r
+    if target in ("all", "goalies"):
+        data["goalies"] = {
+            "home": parse_goalies(left, side="home"),
+            "away": parse_goalies(right, side="away"),
         }
-        return {"ok": True, "match_id": match_id, "season": season, "snippet": norm[:900], "markers": markers, "tried": tried}
-    except Exception as e:
-        return {"ok": False, "match_id": match_id, "season": season, "step": "DEBUG", "status": 500, "error": str(e)}
+    if target in ("all", "lineups"):
+        data["lineups"] = {
+            "home": parse_lineups(left, side="home"),
+            "away": parse_lineups(right, side="away"),
+        }
+
+    return {
+        "ok": True,
+        "match_id": match_id,
+        "season": season,
+        "source_pdf": pdf_url,
+        "pdf_len": len(pdf_bytes),
+        "dpi": 130,  # неважно, мы не OCRим — используем текст-слой
+        "pages_ocr": 1,
+        "data": data,
+    }
