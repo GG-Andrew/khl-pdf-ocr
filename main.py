@@ -140,11 +140,13 @@ def load_dictionaries():
 
 load_dictionaries()
 
-def best_match_name(name: str, pool: List[str], threshold: int = 86) -> str:
+def best_match_name(name: str, pool: List[str], threshold: int = 75) -> str:
+    from rapidfuzz import process, fuzz
     cand, score, _ = process.extractOne(
         name, pool, scorer=fuzz.WRatio
     ) if pool and name else (None, 0, None)
     return cand if cand and score >= threshold else name
+
 
 # ---------------------------- Нормализация текста ----------------------------
 
@@ -335,29 +337,48 @@ def parse_referees_free(text_left: str, text_right: str) -> List[Dict[str,str]]:
     return uniq_limit(out, "role", 2)
 
 def parse_goalies_by_halves(text_left: str, text_right: str) -> Dict[str, List[Dict[str,str]]]:
-    """Парсим вратарей в каждой половине независимо (ищем строки со столбцами или просто ФИО)."""
+    """Парсим вратарей в каждой половине независимо.
+    Поддерживаем варианты: 'NN | В | Фамилия Имя ...' и 'NN В Фамилия Имя ...' (любой регистр)."""
     res = {"home": [], "away": []}
+
+    # общий нормализатор строки имени из столбца
+    def _clean_name_chunk(s: str) -> Optional[str]:
+        s = re.sub(r"\s+", " ", s).strip()
+        # отрезаем хвосты с датами/скобками
+        s = re.sub(r"[\[\(]?\d{1,2}\.\d{1,2}\.\d{2,4}[\]\)]?", "", s)
+        s = s.strip(" |·—-:;,.")
+        if not s:
+            return None
+        m = FIO_RE.search(s)
+        return m.group(0) if m else None
+
     def grab(side_text: str) -> List[Dict[str,str]]:
-        # сначала строки вида "NN | В | Фамилия Имя ..."
-        col_re = re.compile(r"\b\d+\s*\|\s*[ВV]\s*\|\s*([А-ЯЁ][^0-9\|\n]+)")
         out = []
+        side_text = side_text.replace("│", "|")  # тонкие разделители
+        # 1) каноничный столбцовый вариант (с пайпами). Флаг re.I — 'в'/'В'
+        col_re = re.compile(r"\b\d+\s*\|\s*[ВV]\s*\|\s*([А-ЯЁA-Z][^0-9\|\n]+)", flags=re.I)
         for m in col_re.finditer(side_text):
-            nm = clean_possible_name(m.group(1) or "")
+            nm = _clean_name_chunk(m.group(1) or "")
             if nm:
-                nm = best_match_name(nm, PLAYERS_DICT, threshold=86)
+                nm = best_match_name(nm, PLAYERS_DICT, threshold=75)
                 out.append({"name": nm})
-        # если не нашли — ищем просто ФИО рядом со словом "Вратари" или в верхней части блока
+
+        # 2) fallback: без пайпов — 'NN  В  Фамилия Имя ...'
         if not out:
-            blob = " ".join(side_text.splitlines()[:60])
-            for m in FIO_RE.finditer(blob):
-                nm = best_match_name(m.group(0), PLAYERS_DICT, threshold=86)
-                if nm not in [x["name"] for x in out]:
+            loose_re = re.compile(r"\b\d{1,2}\s*[ВV]\s+([А-ЯЁA-Z][^\d\n]{3,})", flags=re.I)
+            for m in loose_re.finditer(side_text):
+                nm = _clean_name_chunk(m.group(1) or "")
+                if nm:
+                    nm = best_match_name(nm, PLAYERS_DICT, threshold=75)
                     out.append({"name": nm})
-        # ограничим до 3
+
+        # дедуп и ограничение до 3-х
         uniq, seen = [], set()
         for o in out:
-            if o["name"] in seen: continue
-            seen.add(o["name"]); uniq.append(o)
+            if o["name"] in seen: 
+                continue
+            seen.add(o["name"])
+            uniq.append(o)
         return uniq[:3]
 
     res["home"] = grab(text_left)
