@@ -1,163 +1,203 @@
-# main.py
-from __future__ import annotations
-
+import io
 import os
-import re
-from typing import List, Dict, Tuple, Optional
+import json
+import time
+from typing import Dict, List, Optional, Tuple
 
-import fitz  # PyMuPDF
-import httpx
+import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+import httpx
+import fitz  # PyMuPDF
+from pdf2image import convert_from_bytes
+from PIL import Image
+import pytesseract
+import regex as re
 
-# fuzzy словари
-from rapidfuzz import process, fuzz
+# --- rapidfuzz (опционально, если установлен) ---
+try:
+    from rapidfuzz import process, fuzz
+    HAS_RAPIDFUZZ = True
+except Exception:
+    HAS_RAPIDFUZZ = False
 
-APP_VERSION = "3.1.0"
-app = FastAPI(title="KHL PDF OCR (column parser)", version=APP_VERSION)
+APP_VERSION = "3.0.0"
 
-# ---------- словари игроков/судей (опциональны, но мы их используем если есть) ----------
-PLAYERS_CSV = os.getenv("PLAYERS_CSV", "players.csv")
-REFEREES_CSV = os.getenv("REFEREES_CSV", "referees.csv")
+# === Буферы словарей ===
+PLAYERS_LIST: List[str] = []
+REFS_LIST: List[str] = []
 
-def _load_list(path: str) -> List[str]:
+def norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def load_csv_basename(fname: str) -> List[str]:
+    path = os.path.join(os.getcwd(), fname)
     if not os.path.exists(path):
         return []
-    vals: List[str] = []
+    items: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            t = line.strip().strip(",;")
-            if t:
-                vals.append(t)
-    return vals
+            name = norm_spaces(line.strip())
+            if name:
+                items.append(name)
+    return items
 
-PLAYERS_LIST = _load_list(PLAYERS_CSV)
-REFS_LIST = _load_list(REFEREES_CSV)
-
-def fuzzy_name(name: str, pool: List[str], cutoff: int = 90) -> str:
-    if not pool:
+def fuzzy_name(name: str, dict_list: List[str], cutoff: int = 90) -> str:
+    """Нормализуем ФИО по словарю (если есть rapidfuzz и словарь)."""
+    name = norm_spaces(name)
+    if not name or not dict_list or not HAS_RAPIDFUZZ:
         return name
-    cand = process.extractOne(name, pool, scorer=fuzz.token_set_ratio)
-    if cand and cand[1] >= cutoff:
-        return cand[0]
+    match = process.extractOne(name, dict_list, scorer=fuzz.WRatio)
+    if match and match[1] >= cutoff:
+        return match[0]
     return name
 
-# ---------- утилы нормализации ----------
-SPACE_RE = re.compile(r"[ \t\u00A0]+")
-def norm_spaces(s: str) -> str:
-    return SPACE_RE.sub(" ", s).strip()
+# === HTTP ===
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru,en;q=0.9",
+    "Referer": "https://www.khl.ru/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
-CAPT_RE = re.compile(r"\b([AKАК])\b\.?$", re.IGNORECASE)
-def split_capt(s: str) -> Tuple[str, str]:
-    s = norm_spaces(s)
-    m = CAPT_RE.search(s)
-    if m:
-        return norm_spaces(CAPT_RE.sub("", s)), m.group(1).upper().replace("К", "K").replace("А", "A")
-    return s, ""
+async def fetch_pdf(url: str) -> bytes:
+    tried = []
+    async with httpx.AsyncClient(timeout=20, headers=HTTP_HEADERS, http2=True, follow_redirects=True) as client:
+        try:
+            r = await client.get(url)
+            tried.append(f"{url} [{r.status_code}]")
+            r.raise_for_status()
+            return r.content
+        except Exception as e:
+            tried.append(f"httpx err: {repr(e)}")
+            raise RuntimeError("|".join(tried))
 
-GK_FLAG_RE = re.compile(r"\b([СР])\b\.?$", re.IGNORECASE)  # С/Р (русские)
+# === Текст-слой через PyMuPDF ===
+def extract_text_pymupdf(pdf_bytes: bytes, max_pages: int = 1) -> str:
+    text_parts: List[str] = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        pages = min(max_pages, len(doc)) if max_pages else len(doc)
+        for p in range(pages):
+            page = doc.load_page(p)
+            # Сохраняем порядок блоков/колонок
+            text_parts.append(page.get_text("text"))
+    return "\n".join(text_parts)
+
+# === OCR fallback (по запросу) ===
+def ocr_text(pdf_bytes: bytes, dpi: int = 200, max_pages: int = 1,
+             scale: float = 1.5, bin_thresh: int = 190) -> str:
+    pages = convert_from_bytes(pdf_bytes, dpi=dpi, fmt="png", first_page=1, last_page=max_pages)
+    out = []
+    for img in pages:
+        if scale and scale != 1.0:
+            w, h = img.size
+            img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+        gray = img.convert("L")
+        # бинаризация
+        bw = gray.point(lambda x: 255 if x > bin_thresh else 0, "1")
+        txt = pytesseract.image_to_string(
+            bw,
+            lang="rus+eng",
+            config="--psm 6 --oem 1 --dpi 300 --tessedit_preserve_interword_spaces=1"
+        )
+        out.append(txt)
+    return "\n".join(out)
+
+# === Парсинг ===
+
+NAME_TOKENS_RE = re.compile(r"[\p{L}\.\-ʼ’`]+", re.IGNORECASE)
+
+GOALIES_SECTION_RE = re.compile(
+    r"Вратари(.+?)(?:Звено|Главный тренер|Линейный|Главный судья|Команда|---RIGHT---|$)",
+    re.IGNORECASE | re.DOTALL
+)
+
+GK_LINE_RE = re.compile(
+    r"""^\s*
+        (\d{1,2})              # номер
+        \s+В\b                 # позиция В
+        \s+([\p{L}\.\-ʼ’` ]+?) # ФИО (с возможными инициалами)
+        (?:\s+([СРSR]))?       # опц флаг S/R/С/Р
+        (?:\s+(\d{2}\.\d{2}\.\d{4}))? # опц ДР
+        (?:\s+(\d{1,2}))?      # опц возраст
+        \s*$""",
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE
+)
+
+LINEUP_LINE_RE = re.compile(
+    r"""^\s*
+        (\d{1,2})              # номер
+        \s+(В|З|Н)\b           # позиция
+        \s+([\p{L}\.\-ʼ’` ]+?) # ФИО
+        (?:\s+[*АКA])?         # опц метки
+        (?:\s+(\d{2}\.\д{2}\.\д{4}))? # (опечатка в шаблоне исключена ниже)
+        \s*$""",
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE
+)
+# Исправим опечатку (в некоторых окружениях \д может не совпасть)
+LINEUP_LINE_RE = re.compile(
+    r"""^\s*
+        (\d{1,2})              # номер
+        \s+(В|З|Н)\b           # позиция
+        \s+([\p{L}\.\-ʼ’` ]+?) # ФИО
+        (?:\s+[*АКA])?         # опц метки
+        (?:\s+(\d{2}\.\d{2}\.\d{4}))? # опц ДР
+        (?:\s+(\d{1,2}))?      # опц возраст
+        \s*$""",
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE
+)
+
+GK_FLAG_RE = re.compile(r"\b([СРSR])\b\.?$", re.IGNORECASE)
+
+def split_capt(name: str) -> Tuple[str, str]:
+    # капитан/ассистент встречаются отдельным столбцом, но иногда кидается к фамилии
+    n = norm_spaces(name)
+    capt = ""
+    if re.search(r"\bК\b\.?$", n, re.IGNORECASE):
+        n = norm_spaces(re.sub(r"\bК\b\.?$", "", n))
+        capt = "K"
+    elif re.search(r"\bA\b\.?$", n):
+        n = norm_spaces(re.sub(r"\bA\b\.?$", "", n))
+        capt = "A"
+    return n, capt
+
 def split_gk_flag(name: str) -> Tuple[str, Optional[str]]:
     n = norm_spaces(name)
     m = GK_FLAG_RE.search(n)
     if m:
-        flag = m.group(1).upper()
-        flag = "S" if flag == "С" else "R"
+        raw = m.group(1).upper()
+        flag = "S" if raw in ("С", "S") else "R"
         return norm_spaces(GK_FLAG_RE.sub("", n)), flag
     return n, None
 
 def gk_status_from_flag(flag: Optional[str]) -> Optional[str]:
-    if flag == "S":
+    if not flag:
+        return None
+    if flag.upper() == "S":
         return "starter"
-    if flag == "R":
+    if flag.upper() == "R":
         return "reserve"
     return None
 
-# ---------- сетевой слой с обходом 403 ----------
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+def split_sides_by_goalies(text: str) -> Tuple[str, str]:
+    """Пробуем поделить лист на левую/правую команду по первому и второму 'Вратари'."""
+    idx = [m.start() for m in re.finditer(r"\bВратари\b", text)]
+    if len(idx) >= 2:
+        return text[idx[0]:idx[1]], text[idx[1]:]
+    # fallback: делим по середине (не идеально, но лучше пусто, чем ничего)
+    mid = len(text) // 2
+    return text[:mid], text[mid:]
 
-BASE_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Referer": "https://www.khl.ru/",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Connection": "keep-alive",
-}
-
-async def fetch_pdf_bytes(url: str, timeout: float = 25.0) -> bytes:
-    """
-    1) прогреваем cookies на главной khl.ru
-    2) выключаем HTTP/2 (http2=False)
-    3) пробуем www.khl.ru и khl.ru
-    """
-    candidates = [url]
-    # продублируем домен без www/с www
-    if "://www.khl.ru/" in url:
-        candidates.append(url.replace("://www.khl.ru/", "://khl.ru/"))
-    elif "://khl.ru/" in url:
-        candidates.append(url.replace("://khl.ru/", "://www.khl.ru/"))
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, http2=False, headers=BASE_HEADERS) as client:
-        # cookie warm-up
-        try:
-            await client.get("https://www.khl.ru/", headers=BASE_HEADERS)
-        except Exception:
-            pass
-
-        last_err: Optional[Exception] = None
-        for u in candidates:
-            try:
-                r = await client.get(u, headers=BASE_HEADERS)
-                r.raise_for_status()
-                return r.content
-            except Exception as e:
-                last_err = e
-
-        # если все кандидаты упали — поднимем ошибку
-        if last_err:
-            raise last_err
-        raise RuntimeError("Unknown fetch error")
-
-# ---------- разрезка на колонки (по координатам) ----------
-def read_pdf_columns(pdf_bytes: bytes) -> Tuple[str, str]:
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        if doc.page_count < 1:
-            return "", ""
-        page = doc[0]
-        blocks = page.get_text("blocks")  # (x0,y0,x1,y1,text, ...)
-        W = float(page.rect.width)
-        mid = W / 2.0
-
-        left_blocks: List[Tuple[float, str]] = []
-        right_blocks: List[Tuple[float, str]] = []
-
-        for b in blocks:
-            x0, y0, x1, y1, txt = float(b[0]), float(b[1]), float(b[2]), float(b[3]), str(b[4])
-            if not txt or not txt.strip():
-                continue
-            if x1 <= mid - 8:
-                left_blocks.append((y0, txt))
-            elif x0 >= mid + 8:
-                right_blocks.append((y0, txt))
-            else:
-                cx = (x0 + x1) / 2.0
-                (left_blocks if cx < mid else right_blocks).append((y0, txt))
-
-        left_text = "\n".join(t for _, t in sorted(left_blocks, key=lambda z: z[0]))
-        right_text = "\n".join(t for _, t in sorted(right_blocks, key=lambda z: z[0]))
-        return left_text, right_text
-
-# ---------- парсеры ----------
-# Судьи
-NAME_TOKENS_RE = re.compile(r"[A-Za-zА-Яа-яЁё\.\-ʼ’`]+")
-def parse_refs(side_text: str) -> List[Dict[str, str]]:
+def parse_refs(text: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
-    for line in side_text.splitlines():
-        line = norm_spaces(line)
-        if not line:
-            continue
+    lines = [norm_spaces(l) for l in text.splitlines()]
+    for i, line in enumerate(lines):
         role = None
         if "Главный судья" in line:
             role = "Главный судья"
@@ -165,31 +205,26 @@ def parse_refs(side_text: str) -> List[Dict[str, str]]:
             role = "Линейный судья"
         if not role:
             continue
-        tokens = NAME_TOKENS_RE.findall(line)
-        tokens = [t for t in tokens if t.lower() not in ("главный", "судья", "линейный")]
-        if len(tokens) >= 2:
-            name = f"{tokens[0]} {tokens[1]}"
+
+        # Пытаемся вытащить имя из этой строки
+        toks = NAME_TOKENS_RE.findall(line)
+        toks = [t for t in toks if t.lower() not in ("главный", "судья", "линейный")]
+        name = None
+        if len(toks) >= 2:
+            name = f"{toks[0]} {toks[1]}"
+
+        # Если нет — смотрим 1–2 строки ниже
+        if not name:
+            for j in (i + 1, i + 2):
+                if 0 <= j < len(lines):
+                    ntoks = NAME_TOKENS_RE.findall(lines[j])
+                    if len(ntoks) >= 2:
+                        name = f"{ntoks[0]} {ntoks[1]}"
+                        break
+        if name:
             name = fuzzy_name(name, REFS_LIST)
             out.append({"role": role, "name": name})
     return out
-
-def dedup_refs(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    seen = set()
-    res = []
-    for r in items:
-        key = (r.get("role", ""), r.get("name", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        res.append(r)
-    return res
-
-# Вратари
-GOALIES_SECTION_RE = re.compile(r"Вратари(.+?)(?:Звено|Главный тренер|Линейный|Главный судья|---RIGHT---|$)", re.IGNORECASE | re.DOTALL)
-GK_LINE_RE = re.compile(
-    r"^\s*(\d{1,2})\s+В\b[^\n]*?\b([A-Za-zА-Яа-яЁё\. \-ʼ’`]+?)(?:\s+([СР]))?\s+(?:\d{2}\.\d{2}\.\d{4})",
-    re.MULTILINE
-)
 
 def parse_goalies(side_text: str, side: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
@@ -197,9 +232,7 @@ def parse_goalies(side_text: str, side: str) -> List[Dict[str, str]]:
     if not m:
         return out
     sec = m.group(1)
-
     for mm in GK_LINE_RE.finditer(sec):
-        num = mm.group(1)
         raw_name = norm_spaces(mm.group(2))
         raw_name, flag = split_gk_flag(raw_name)
         name = fuzzy_name(raw_name, PLAYERS_LIST)
@@ -207,20 +240,13 @@ def parse_goalies(side_text: str, side: str) -> List[Dict[str, str]]:
         out.append({"name": name, "status": status})
     return out
 
-# Составы
-LINEUP_LINE_RE = re.compile(
-    r"^\s*(\d{1,2})\s+(В|З|Н)\s+([A-Za-zА-Яа-яЁё\. \-ʼ’`]+?)\s+(?:\d{2}\.\d{2}\.\d{4})",
-    re.MULTILINE
-)
-
 def parse_lineups(side_text: str, side: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for mm in LINEUP_LINE_RE.finditer(side_text):
-        num, pos, raw_name = mm.group(1), mm.group(2), mm.group(3)
+        num, pos, raw_name, dob, age = mm.group(1), mm.group(2), mm.group(3), mm.group(4), mm.group(5)
         raw_name, gk_flag = split_gk_flag(raw_name)
         name, capt = split_capt(raw_name)
         name = fuzzy_name(name, PLAYERS_LIST)
-
         item: Dict[str, str] = {
             "side": side,
             "num": num,
@@ -228,13 +254,10 @@ def parse_lineups(side_text: str, side: str) -> List[Dict[str, str]]:
             "name": name,
             "capt": capt,
         }
-        # DOB/age (если в хвосте)
-        tail = side_text[mm.end():mm.end()+32]
-        mdate = re.search(r"\b(\d{2}\.\d{2}\.\d{4})\b(?:\s+(\d{1,2}))?", tail)
-        if mdate:
-            item["dob"] = mdate.group(1)
-            if mdate.group(2):
-                item["age"] = mdate.group(2)
+        if dob:
+            item["dob"] = dob
+        if age:
+            item["age"] = age
         if pos == "В" and gk_flag:
             item["gk_flag"] = gk_flag
             status = gk_status_from_flag(gk_flag)
@@ -243,92 +266,111 @@ def parse_lineups(side_text: str, side: str) -> List[Dict[str, str]]:
         out.append(item)
     return out
 
-# ---------- API ----------
+# === FastAPI ===
+app = FastAPI()
+
 @app.get("/")
-async def root():
+def root():
     return {
         "ok": True,
         "service": "khl-pdf-ocr",
         "version": APP_VERSION,
         "ready": True,
         "dicts": {
-            "players_csv": os.path.exists(PLAYERS_CSV),
-            "referees_csv": os.path.exists(REFEREES_CSV),
+            "players_csv": os.path.exists("players.csv"),
+            "referees_csv": os.path.exists("referees.csv"),
             "players_loaded": len(PLAYERS_LIST),
             "refs_loaded": len(REFS_LIST),
         },
     }
 
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
+@app.on_event("startup")
+def _startup():
+    global PLAYERS_LIST, REFS_LIST
+    PLAYERS_LIST = load_csv_basename("players.csv")
+    REFS_LIST = load_csv_basename("referees.csv")
 
-@app.get("/ocr")
-async def ocr_endpoint(
-    pdf_url: str = Query(...),
-    match_id: int = Query(...),
-    season: int = Query(...),
-):
-    try:
-        pdf_bytes = await fetch_pdf_bytes(pdf_url)
-    except Exception as e:
-        return JSONResponse({
-            "ok": False, "match_id": match_id, "season": season,
-            "step": "GET", "status": 599, "error": str(e)
-        })
-
-    left, right = read_pdf_columns(pdf_bytes)
-    snippet = norm_spaces((left + "\n" + right)[:700])
-    return {
+def build_ok(match_id, season, source_pdf, data, pdf_len=None, dpi=None, pages_ocr=1, extra=None):
+    resp = {
         "ok": True,
         "match_id": match_id,
         "season": season,
-        "source_pdf": pdf_url,
-        "pdf_len": len(pdf_bytes),
-        "pages_ocr": 1,
-        "text_len": len(left) + len(right),
-        "snippet": snippet,
+        "source_pdf": source_pdf,
+        "pdf_len": pdf_len,
+        "dpi": dpi,
+        "pages_ocr": pages_ocr,
+        "data": data,
+    }
+    if extra:
+        resp.update(extra)
+    return resp
+
+def build_err(match_id, season, step, status=None, tried=None, error=None):
+    return {
+        "ok": False,
+        "match_id": match_id,
+        "season": season,
+        "step": step,
+        "status": status,
+        "tried": tried,
+        "error": error,
     }
 
 @app.get("/extract")
-async def extract_endpoint(
-    pdf_url: str = Query(...),
+async def extract(
     match_id: int = Query(...),
+    pdf_url: str = Query(...),
     season: int = Query(...),
-    target: str = Query("all", description="all|refs|goalies|lineups"),
+    target: str = Query("all", pattern="^(all|refs|goalies|lineups)$"),
+    dpi: int = Query(130, ge=120, le=360),
+    max_pages: int = Query(1, ge=1, le=5),
+    force_ocr: int = Query(0, ge=0, le=1),
 ):
+    tried = []
     try:
-        pdf_bytes = await fetch_pdf_bytes(pdf_url)
+        pdf = await fetch_pdf(pdf_url)
+        tried.append(f"{pdf_url} [200]")
     except Exception as e:
-        return JSONResponse({
-            "ok": False, "match_id": match_id, "season": season,
-            "step": "GET", "status": 599, "error": str(e)
-        })
+        return JSONResponse(build_err(match_id, season, "GET", 599, [str(e)]), status_code=200)
 
-    left, right = read_pdf_columns(pdf_bytes)
+    pdf_len = len(pdf)
+    # 1) Текст-слой
+    text = ""
+    try:
+        text = extract_text_pymupdf(pdf, max_pages=max_pages)
+    except Exception as e:
+        text = ""
+
+    # 2) OCR по запросу
+    if force_ocr or not text or len(norm_spaces(text)) < 100:
+        try:
+            text = ocr_text(pdf, dpi=dpi, max_pages=max_pages)
+        except Exception as e:
+            return JSONResponse(build_err(match_id, season, "OCR", 500, tried, str(e)), status_code=200)
+
+    text = text.replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Разделим на две стороны
+    left, right = split_sides_by_goalies(text)
 
     data: Dict[str, object] = {}
-    if target in ("all", "refs"):
-        refs = dedup_refs(parse_refs(left) + parse_refs(right))
-        data["refs"] = refs
-    if target in ("all", "goalies"):
+    if target in ("refs", "all"):
+        data["refs"] = parse_refs(text)
+    if target in ("goalies", "all"):
         data["goalies"] = {
-            "home": parse_goalies(left, side="home"),
-            "away": parse_goalies(right, side="away"),
+            "home": parse_goalies(left, "home"),
+            "away": parse_goalies(right, "away"),
         }
-    if target in ("all", "lineups"):
+    if target in ("lineups", "all"):
         data["lineups"] = {
-            "home": parse_lineups(left, side="home"),
-            "away": parse_lineups(right, side="away"),
+            "home": parse_lineups(left, "home"),
+            "away": parse_lineups(right, "away"),
         }
 
-    return {
-        "ok": True,
-        "match_id": match_id,
-        "season": season,
-        "source_pdf": pdf_url,
-        "pdf_len": len(pdf_bytes),
-        "dpi": 130,
-        "pages_ocr": 1,
-        "data": data,
-    }
+    return JSONResponse(build_ok(match_id, season, pdf_url, data, pdf_len=pdf_len, dpi=dpi))
+
+if __name__ == "__main__":
+    # Для локального запуска; в Render это будет запускаться из Docker CMD
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, workers=1)
