@@ -1,11 +1,17 @@
 # main.py
-# KHL PDF OCR Server — v2.1.1 (text-layer first, coords-based lineups, safe name correction)
-# Эндпойнты:
-#   /                 — health (пути словарей)
-#   /ocr              — берёт текст-слой; если его нет — OCR fallback
-#   /extract          — refs + goalies + lineups{home,away} на основе координат PyMuPDF
+# KHL PDF OCR Server — v2.2.0
+# - Быстрый парсинг текст-слоя (PyMuPDF)
+# - Координатная разметка колонок: № | Поз | Фамилия Имя | Д.Р. | Лет
+# - Безопасная коррекция ФИО (без кросс-командных подстановок)
+# - Метки вратарей: gk_flag ("S"/"R") и gk_status ("starter"/"reserve"/None)
+# - Улучшенный парсер судей (поддержка повторов ролей)
 #
-# Зависимости (requirements.txt):
+# Endpoints:
+#   /                    — health
+#   /ocr                 — текст-слой (fast), OCR как fallback
+#   /extract             — refs | goalies | lineups | all
+#
+# requirements.txt (минимум):
 #   fastapi
 #   uvicorn
 #   httpx
@@ -30,7 +36,7 @@ import pytesseract
 
 from rapidfuzz import process, fuzz
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 DEFAULT_SEASON = 1369
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
@@ -54,7 +60,7 @@ PDF_TEMPLATES = [
 PLAYERS_DICT: List[str] = []
 REFEREES_DICT: List[str] = []
 DICT_SOURCES: Dict[str, str] = {"players": "", "referees": ""}
-USE_DICTIONARIES = True  # можно временно выключить для тестов
+USE_DICTIONARIES = True  # поставь False, чтобы полностью игнорировать словари
 
 def _find_path(cands: List[str]) -> Optional[str]:
     for p in cands:
@@ -249,17 +255,17 @@ def detect_header_and_columns(rows) -> Optional[Dict[str,float]]:
                 if t.startswith("Д.") or t.startswith("Д.Р"): col["dob_x"] = w[0]
                 if t == "Лет": col["age_x"] = w[0]
             if set(("num_x","pos_x","name_x","dob_x","age_x")).issubset(col.keys()):
-                # правая граница колонки ФИО — начало следующей колонки (Д.Р.)
-                col["name_r_x"] = col["dob_x"]
+                col["name_r_x"] = col["dob_x"]  # правая граница ФИО — начало Д.Р.
                 return col
     return None
 
+# ==================== Row → Player ====================
 
 def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
     """
-    Маппим слова по диапазонам X. Для колонки ФИО дополнительно вынимаем
-    метки вратаря: 'С' (стартер) / 'Р' (резерв) – сохраняем в полях gk_flag/gk_status,
-    но не включаем в name.
+    Маппим слова по диапазонам X. Для колонки ФИО:
+    - включаем только диапазон [name_x .. dob_x)
+    - вынимаем метки вратарей 'С/Р' как gk_flag (и status), но НЕ включаем их в name.
     """
     δ = 2.5
     name_l = cols["name_x"] - δ
@@ -299,7 +305,6 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
     for t in buckets["name"]:
         if t in ("А","A","К","K"):
             capt = "A" if t in ("А","A") else "K"
-        # метка старт/резерв – допускаем русский/латинский символ
         if t in ("С","C","S"):
             gk_flag = "S"
         elif t in ("Р","P","R"):
@@ -312,8 +317,6 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
     raw_name = raw_name.replace(" ,", ",").replace(", ", " ")
     m = FIO_RE.search(raw_name)
     name = m.group(0) if m else raw_name
-    # (опционально) убрать ударения:
-    # name = strip_accents(name)
     name = best_match(name, PLAYERS_DICT)  # безопасная коррекция
 
     dob = next((w for w in buckets["dob"] if DATE_RE.match(w)), "")
@@ -338,6 +341,23 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
         "gk_status": gk_status,
     }
 
+def parse_lineups_struct(words_half, side: str):
+    rows = group_rows(words_half)
+    cols = detect_header_and_columns(rows)
+    if not cols:
+        return []
+    players = []
+    header_seen = False
+    for row in rows:
+        txt = " ".join(w[4] for w in row)
+        if not header_seen:
+            if ("Фамилия" in txt and "Лет" in txt):
+                header_seen = True
+            continue
+        p = row_to_player(row, cols, side)
+        if p and p["name"] and p["pos"] in ("В","З","Н"):
+            players.append(p)
+    return players
 
 # ==================== Refs ====================
 
@@ -345,20 +365,46 @@ def parse_refs_from_text(lt: str, rt: str) -> List[Dict[str,str]]:
     lines = [l.strip() for l in (lt+"\n"+rt).split("\n") if l.strip()]
     roles = ["Главный судья","Линейный судья","Резервный главный судья","Резервный судья","Резервный линейный судья"]
     out = []
-    for i, ln in enumerate(lines):
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        matched = None
         for role in roles:
-            if re.search(rf"^{role}\b", ln, flags=re.I):
-                for cand in [ln] + lines[i+1:i+3]:
-                    m = FIO_RE.search(cand)
-                    if m:
-                        out.append({"role": role, "name": best_match(m.group(0), REFEREES_DICT)})
-                        break
+            if re.search(rf"(^|\s){role}(\s|$)", ln):
+                matched = role
+                break
+        if not matched:
+            i += 1
+            continue
+
+        # сколько раз роль повторяется подряд на этой строке
+        repeats = len(re.findall(rf"{matched}", ln))
+        # и на следующих строках (когда пишут вторую роль на новой строке)
+        j = i + 1
+        while j < len(lines) and re.fullmatch(rf"{matched}\b", lines[j]):
+            repeats += 1
+            j += 1
+
+        # забираем столько имён, сколько повторов роли
+        names = []
+        k = j
+        while k < len(lines) and len(names) < repeats and (k - j) < 6:
+            nm = FIO_RE.search(lines[k])
+            if nm:
+                names.append(best_match(nm.group(0), REFEREES_DICT))
+            k += 1
+
+        for nm in names:
+            out.append({"role": matched, "name": nm})
+
+        i = k  # перескочили за обработанный блок
+
     # дедуп
     seen, res = set(), []
     for j in out:
-        k=(j["role"], j["name"])
-        if k in seen: continue
-        seen.add(k); res.append(j)
+        key = (j["role"], j["name"])
+        if key in seen: continue
+        seen.add(key); res.append(j)
     return res
 
 # ==================== OCR fallback ====================
@@ -476,14 +522,14 @@ async def extract_structured(
     if not pdf_bytes:
         return {"ok": False, "step":"GET","status":404,"match_id":match_id,"season":season,"tried":tried,"error":last_err}
 
-    # текст-слой
+    # текст-слой + слова
     lt, rt = extract_page_halves_text(pdf_bytes)
     L_words, R_words = extract_words_by_half(pdf_bytes)
 
     data: Dict[str,object] = {}
     keys = ["refs","goalies","lineups"] if target == "all" else [target]
 
-    # lineups сразу считаем один раз (нужно и для goalies)
+    # lineups считаем один раз (нужно и для goalies)
     home_players = away_players = None
     if "lineups" in keys or "goalies" in keys or target == "all":
         home_players = parse_lineups_struct(L_words, "home")
@@ -495,10 +541,17 @@ async def extract_structured(
         elif k == "lineups":
             data["lineups"] = {"home": home_players or [], "away": away_players or []}
         elif k == "goalies":
-            data["goalies"] = {
-                "home": [{"name": p["name"]} for p in (home_players or []) if p["pos"] == "В"][:3],
-                "away": [{"name": p["name"]} for p in (away_players or []) if p["pos"] == "В"][:3],
-            }
+            def map_goalies(players):
+                arr = []
+                for p in players or []:
+                    if p.get("pos") == "В":
+                        status = p.get("gk_status") or "unknown"
+                        arr.append({"name": p.get("name",""), "status": status})
+                # сортировка: starter -> unknown -> reserve
+                order = {"starter": 0, "unknown": 1, "reserve": 2}
+                arr.sort(key=lambda x: order.get(x["status"], 1))
+                return arr
+            data["goalies"] = {"home": map_goalies(home_players), "away": map_goalies(away_players)}
 
     return {
         "ok": True,
