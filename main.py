@@ -249,35 +249,79 @@ def detect_header_and_columns(rows) -> Optional[Dict[str,float]]:
                 if t.startswith("Д.") or t.startswith("Д.Р"): col["dob_x"] = w[0]
                 if t == "Лет": col["age_x"] = w[0]
             if set(("num_x","pos_x","name_x","dob_x","age_x")).issubset(col.keys()):
+                # правая граница колонки ФИО — начало следующей колонки (Д.Р.)
+                col["name_r_x"] = col["dob_x"]
                 return col
     return None
 
-def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
-    # Раскидываем слова по ближайшей колонке (по x0)
-    buckets = {"num":[],"pos":[],"name":[],"dob":[],"age":[]}
-    for x0,y0,x1,y1,t in row:
-        dx = {
-            "num": abs(x0 - cols["num_x"]),
-            "pos": abs(x0 - cols["pos_x"]),
-            "name": abs(x0 - cols["name_x"]),
-            "dob": abs(x0 - cols["dob_x"]),
-            "age": abs(x0 - cols["age_x"]),
-        }
-        key = min(dx, key=dx.get)
-        buckets[key].append(t)
 
+def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
+    """
+    Разбрасываем по колонкам не "к ближайшему x", а по диапазонам:
+      - name: x ∈ [name_x - δ, name_r_x - δ]
+      - dob:  токены, похожие на дату
+      - age:  число 2-значное в правой зоне
+      - pos:  одиночная буква В/З/Н возле pos_x (слева от name_x)
+      - num:  число слева от pos_x
+    """
+    δ = 2.5  # небольшая "поблажка" по x
+    name_l = cols["name_x"] - δ
+    name_r = cols.get("name_r_x", cols["dob_x"]) - δ
+
+    buckets = {"num": [], "pos": [], "name": [], "dob": [], "age": []}
+
+    for x0,y0,x1,y1,t in row:
+        # приоритет по содержимому
+        if DATE_RE.match(t):
+            buckets["dob"].append(t); 
+            continue
+        if re.fullmatch(r"\d{1,2}", t):
+            # возможно возраст (в правой стороне) — проверим ближе ли к age_x
+            if abs(x0 - cols["age_x"]) < abs(x0 - cols["name_x"]):
+                buckets["age"].append(t); 
+                continue
+
+        # позиция — одиночная буква В/З/Н слева от name
+        if POS_RE.match(t) and x0 < name_l:
+            # контроль: ближе к pos_x, чем к num_x
+            if abs(x0 - cols["pos_x"]) <= abs(x0 - cols["num_x"]):
+                buckets["pos"].append(t); 
+                continue
+
+        # номер — любое число слева от pos_x
+        if re.fullmatch(r"\d{1,2}", t) and x0 < cols["pos_x"]:
+            buckets["num"].append(t); 
+            continue
+
+        # ФИО — всё, что попадает в диапазон колонки имени
+        if name_l <= x0 < name_r:
+            buckets["name"].append(t); 
+            continue
+
+        # fallback: если слово сразу справа от pos_x, тоже считаем именем
+        if cols["pos_x"] <= x0 < name_r:
+            buckets["name"].append(t); 
+            continue
+
+    # собрать поля
     num = next((re.sub(r"\D","",w) for w in buckets["num"] if re.search(r"\d", w)), "")
     pos = next((w for w in buckets["pos"] if POS_RE.match(w)), "")
-    # имя и возможная метка капитана (A/К)
-    capt = ""
-    name_tokens = buckets["name"][:]
-    for t in name_tokens:
-        if t in ("А","A","К","K"):
-            capt = "A" if t in ("А","A") else "K"
-    raw_name = " ".join([t for t in name_tokens if t not in ("А","A","К","K")]).strip(" ,*")
+
+    # имя: склеиваем токены между name_x и dob_x
+    # чистим служебные символы/звёздочки и вынимаем "Фамилия Имя ..."
+    name_tokens = [t for t in buckets["name"] if t not in ("А","A","К","K","*","·",",")]
+    raw_name = " ".join(name_tokens).strip(" ,*")
+    # иногда в тексте "Фамилия," и "Имя" отдельными токенами — подправим запятую
+    raw_name = raw_name.replace(" ,", ",").replace(", ", " ")
     m = FIO_RE.search(raw_name)
     name = m.group(0) if m else raw_name
-    name = best_match(name, PLAYERS_DICT)  # безопасная коррекция
+    name = best_match(name, PLAYERS_DICT)  # безопасная коррекция (строгая)
+
+    # метка капитана
+    capt = ""
+    for t in buckets["name"]:
+        if t in ("А","A","К","K"):
+            capt = "A" if t in ("А","A") else "K"
 
     dob = next((w for w in buckets["dob"] if DATE_RE.match(w)), "")
     age = next((re.sub(r"\D","",w) for w in buckets["age"] if re.search(r"\d", w)), "")
@@ -285,6 +329,7 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
     if not (num or pos or name):
         return None
     return {"side": side, "num": num, "pos": pos, "name": name, "capt": capt, "dob": dob, "age": age}
+
 
 def parse_lineups_struct(words_half, side: str):
     rows = group_rows(words_half)
