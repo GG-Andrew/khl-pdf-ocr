@@ -257,14 +257,11 @@ def detect_header_and_columns(rows) -> Optional[Dict[str,float]]:
 
 def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
     """
-    Разбрасываем по колонкам не "к ближайшему x", а по диапазонам:
-      - name: x ∈ [name_x - δ, name_r_x - δ]
-      - dob:  токены, похожие на дату
-      - age:  число 2-значное в правой зоне
-      - pos:  одиночная буква В/З/Н возле pos_x (слева от name_x)
-      - num:  число слева от pos_x
+    Маппим слова по диапазонам X. Для колонки ФИО дополнительно вынимаем
+    метки вратаря: 'С' (стартер) / 'Р' (резерв) – сохраняем в полях gk_flag/gk_status,
+    но не включаем в name.
     """
-    δ = 2.5  # небольшая "поблажка" по x
+    δ = 2.5
     name_l = cols["name_x"] - δ
     name_r = cols.get("name_r_x", cols["dob_x"]) - δ
 
@@ -276,78 +273,71 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
             buckets["dob"].append(t); 
             continue
         if re.fullmatch(r"\d{1,2}", t):
-            # возможно возраст (в правой стороне) — проверим ближе ли к age_x
             if abs(x0 - cols["age_x"]) < abs(x0 - cols["name_x"]):
                 buckets["age"].append(t); 
                 continue
-
-        # позиция — одиночная буква В/З/Н слева от name
         if POS_RE.match(t) and x0 < name_l:
-            # контроль: ближе к pos_x, чем к num_x
             if abs(x0 - cols["pos_x"]) <= abs(x0 - cols["num_x"]):
                 buckets["pos"].append(t); 
                 continue
-
-        # номер — любое число слева от pos_x
         if re.fullmatch(r"\d{1,2}", t) and x0 < cols["pos_x"]:
             buckets["num"].append(t); 
             continue
-
-        # ФИО — всё, что попадает в диапазон колонки имени
         if name_l <= x0 < name_r:
             buckets["name"].append(t); 
             continue
-
-        # fallback: если слово сразу справа от pos_x, тоже считаем именем
         if cols["pos_x"] <= x0 < name_r:
             buckets["name"].append(t); 
             continue
 
-    # собрать поля
     num = next((re.sub(r"\D","",w) for w in buckets["num"] if re.search(r"\d", w)), "")
     pos = next((w for w in buckets["pos"] if POS_RE.match(w)), "")
 
-    # имя: склеиваем токены между name_x и dob_x
-    # чистим служебные символы/звёздочки и вынимаем "Фамилия Имя ..."
-    name_tokens = [t for t in buckets["name"] if t not in ("А","A","К","K","*","·",",")]
-    raw_name = " ".join(name_tokens).strip(" ,*")
-    # иногда в тексте "Фамилия," и "Имя" отдельными токенами — подправим запятую
-    raw_name = raw_name.replace(" ,", ",").replace(", ", " ")
-    m = FIO_RE.search(raw_name)
-    name = m.group(0) if m else raw_name
-    name = best_match(name, PLAYERS_DICT)  # безопасная коррекция (строгая)
-
-    # метка капитана
+    # --- метки капитана и S/R для вратарей ---
     capt = ""
+    gk_flag = ""  # "S"|"R" для вратарей
     for t in buckets["name"]:
         if t in ("А","A","К","K"):
             capt = "A" if t in ("А","A") else "K"
+        # метка старт/резерв – допускаем русский/латинский символ
+        if t in ("С","C","S"):
+            gk_flag = "S"
+        elif t in ("Р","P","R"):
+            gk_flag = "R"
+
+    # имя: исключаем служебные одиночные буквы (A/K/S/R и т.п.)
+    IGNORE = {"А","A","К","K","С","C","S","Р","P","R","*","·",","}
+    name_tokens = [t for t in buckets["name"] if t not in IGNORE and not re.fullmatch(r"[A-Za-zА-Яа-яЁё]\.?$", t)]
+    raw_name = " ".join(name_tokens).strip(" ,*")
+    raw_name = raw_name.replace(" ,", ",").replace(", ", " ")
+    m = FIO_RE.search(raw_name)
+    name = m.group(0) if m else raw_name
+    # (опционально) убрать ударения:
+    # name = strip_accents(name)
+    name = best_match(name, PLAYERS_DICT)  # безопасная коррекция
 
     dob = next((w for w in buckets["dob"] if DATE_RE.match(w)), "")
     age = next((re.sub(r"\D","",w) for w in buckets["age"] if re.search(r"\d", w)), "")
 
     if not (num or pos or name):
         return None
-    return {"side": side, "num": num, "pos": pos, "name": name, "capt": capt, "dob": dob, "age": age}
 
+    gk_status = None
+    if pos == "В":
+        gk_status = "starter" if gk_flag == "S" else ("reserve" if gk_flag == "R" else None)
 
-def parse_lineups_struct(words_half, side: str):
-    rows = group_rows(words_half)
-    cols = detect_header_and_columns(rows)
-    if not cols:
-        return []
-    players = []
-    header_seen = False
-    for row in rows:
-        txt = " ".join(w[4] for w in row)
-        if not header_seen:
-            if ("Фамилия" in txt and "Лет" in txt):
-                header_seen = True
-            continue
-        p = row_to_player(row, cols, side)
-        if p and p["name"] and p["pos"] in ("В","З","Н"):
-            players.append(p)
-    return players
+    return {
+        "side": side,
+        "num": num,
+        "pos": pos,
+        "name": name,
+        "capt": capt,
+        "dob": dob,
+        "age": age,
+        "gk_flag": gk_flag if pos == "В" else "",
+        "gk_status": gk_status,
+    }
+
 
 # ==================== Refs ====================
 
