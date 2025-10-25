@@ -1,8 +1,8 @@
 # main.py
-# KHL PDF OCR Server — v1.4.0 (fast + fuzzy dictionaries)
-# - /          : health
-# - /ocr       : быстрый OCR (split на 2 колонки, dpi=130/scale=1.10), LRU-кэш 15 мин
-# - /extract   : структура (refs[], goalies{home,away}, lineups_raw) + фаззи-исправление ФИО по словарям
+# KHL PDF OCR Server — v1.5.0 (halves-aware parsing + root dictionaries)
+# - /          : health (+показывает, откуда словари подхватились)
+# - /ocr       : быстрый OCR (split на 2 половины), LRU-кэш 15 мин
+# - /extract   : refs[], goalies{home,away}, lineups_raw; парсинг по половинам
 # Ошибки -> JSON {"ok": false, "step": "...","error":"..."}
 
 import os, re, time, hashlib, csv
@@ -17,7 +17,7 @@ from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 from rapidfuzz import process, fuzz
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 DEFAULT_SEASON = 1369
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
@@ -54,7 +54,7 @@ class TTLCache(OrderedDict):
     def __init__(self, maxsize=64, ttl=900):
         super().__init__()
         self.maxsize = maxsize
-        self.ttl = ttl  # seconds
+        self.ttl = ttl
     def _now(self): return time.time()
     def get_cached(self, key):
         item = super().get(key)
@@ -78,68 +78,69 @@ def cache_key_pdf(pdf_bytes: bytes, dpi: int, max_pages: int, scale: float, bin_
     h = hashlib.sha256(pdf_bytes).hexdigest()[:16]
     return f"{h}:{dpi}:{max_pages}:{scale}:{bin_thresh}"
 
-# ---------------------------- Словари ФИО (игроки/судьи) ----------------------------
+# ---------------------------- Словари ФИО (ищем и в корне, и в data/) ----------------------------
 
 PLAYERS_DICT: List[str] = []
 REFEREES_DICT: List[str] = []
+DICT_SOURCES: Dict[str, str] = {"players": "", "referees": ""}
+
+def _find_path(candidates: List[str]) -> Optional[str]:
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 def _load_names_from_file(path: str) -> List[str]:
-    if not os.path.exists(path):
-        return []
+    if not path: return []
     names = []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            # поддерживаем и plain-текст (по строке), и CSV с колонкой name
-            sniffer = csv.Sniffer()
-            sample = f.read(1024)
-            f.seek(0)
-            is_csv = False
+            # поддерживаем и plain-текст, и CSV
+            first_kb = f.read(1024); f.seek(0)
             try:
-                is_csv = sniffer.has_header(sample)
+                sn = csv.Sniffer()
+                is_csv = sn.has_header(first_kb)
             except Exception:
                 is_csv = False
             if is_csv:
                 reader = csv.DictReader(f)
                 col = None
-                # найдём подходящее поле
                 for cand in ("name", "fio", "ФИО", "Name"):
-                    if cand in reader.fieldnames:
-                        col = cand
-                        break
-                if not col:  # fallback: возьмём первую колонку
+                    if reader.fieldnames and cand in reader.fieldnames:
+                        col = cand; break
+                if not col and reader.fieldnames:
                     col = reader.fieldnames[0]
                 for row in reader:
                     val = (row.get(col) or "").strip()
-                    if val:
-                        names.append(val)
+                    if val: names.append(val)
             else:
-                f.seek(0)
                 for line in f:
                     line = line.strip()
-                    if line:
-                        names.append(line)
+                    if line: names.append(line)
     except Exception:
-        pass
-    # нормализуем пробелы, первую букву прописную
+        return []
+    # нормализация
     out = []
     for n in names:
         s = re.sub(r"\s+", " ", n).strip()
-        if not s:
-            continue
+        if not s: continue
         parts = s.split()
         s = " ".join([parts[0].capitalize()] + [p.capitalize() for p in parts[1:]])
         out.append(s)
     return sorted(set(out))
 
 def load_dictionaries():
-    global PLAYERS_DICT, REFEREES_DICT
-    PLAYERS_DICT = _load_names_from_file("data/players.csv")
-    REFEREES_DICT = _load_names_from_file("data/referees.csv")
+    global PLAYERS_DICT, REFEREES_DICT, DICT_SOURCES
+    p_path = _find_path(["players.csv", "data/players.csv"])
+    r_path = _find_path(["referees.csv", "data/referees.csv"])
+    DICT_SOURCES["players"] = p_path or ""
+    DICT_SOURCES["referees"] = r_path or ""
+    PLAYERS_DICT = _load_names_from_file(p_path) if p_path else []
+    REFEREES_DICT = _load_names_from_file(r_path) if r_path else []
 
 load_dictionaries()
 
 def best_match_name(name: str, pool: List[str], threshold: int = 86) -> str:
-    """Фаззи-исправление OCR-имени по словарю; если < threshold — вернём исходник."""
     cand, score, _ = process.extractOne(
         name, pool, scorer=fuzz.WRatio
     ) if pool and name else (None, 0, None)
@@ -164,9 +165,7 @@ COMMON_FIXES = [
 def normalize_cyrillic(text: str) -> str:
     if not text: return text
     s = text.translate(LAT_TO_CYR)
-    # "БелоусовГеоргий" -> "Белоусов Георгий" (осторожно, не разрезать «СоставыКоманд»)
     s = re.sub(r"(?<![А-ЯЁа-яё])([А-ЯЁ][а-яё]{2,})([А-ЯЁ][а-яё]{2,})", r"\1 \2", s)
-    # "ФамилияИ." -> "Фамилия И."
     s = re.sub(r"([А-ЯЁ][а-яё]+)([А-ЯЁ]\.)", r"\1 \2", s)
     for pat, repl in COMMON_FIXES:
         s = re.sub(pat, repl, s)
@@ -174,7 +173,7 @@ def normalize_cyrillic(text: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-# ---------------------------- OCR-препроцесс / OCR (быстро) ----------------------------
+# ---------------------------- OCR-препроцесс / OCR (по половинам) ----------------------------
 
 def preprocess(img, scale: float = 1.10, bin_thresh: int = 185):
     w, h = img.size
@@ -189,46 +188,52 @@ def ocr_one(im, lang="rus+eng"):
     cfg = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
     return pytesseract.image_to_string(im, lang=lang, config=cfg)
 
-def ocr_fast_halves(page_img) -> str:
-    """Режем страницу пополам по вертикали — меньше мусора, быстрее."""
+def ocr_fast_halves(page_img) -> Tuple[str, str]:
+    """Возвращаем ТЕКСТ ЛЕВОЙ и ПРАВОЙ половины отдельно."""
     w, h = page_img.size
     mid = w // 2
     left = page_img.crop((0, 0, mid, h))
     right = page_img.crop((mid, 0, w, h))
-    return ocr_one(left) + "\n" + ocr_one(right)
+    return ocr_one(left), ocr_one(right)
 
-def cache_key_pdf(pdf_bytes: bytes, dpi: int, max_pages: int, scale: float, bin_thresh: int) -> str:
-    h = hashlib.sha256(pdf_bytes).hexdigest()[:16]
-    return f"{h}:{dpi}:{max_pages}:{scale}:{bin_thresh}"
-
-def run_ocr_pipeline(pdf_bytes: bytes, dpi: int, max_pages: int, scale: float, bin_thresh: int) -> Tuple[str, int, Dict[str,float]]:
-    key = cache_key_pdf(pdf_bytes, dpi, max_pages, scale, bin_thresh)
+def run_ocr_pipeline(pdf_bytes: bytes, dpi: int, max_pages: int, scale: float, bin_thresh: int):
+    """
+    Возвращает:
+      full_text: str        — левый+правый текст(ы) всех страниц
+      pages_cnt: int
+      halves_text: List[Tuple[left_text, right_text]] — на каждую страницу
+      metrics: dict
+    """
+    key = cache_key_pdf(pdf_bytes, dpi, max_pages, scale, bin_thresh) + ":halves"
     cached = OCR_CACHE.get_cached(key)
     if cached:
-        return cached["text"], cached["pages"], cached["metrics"]
+        return cached["text"], cached["pages"], cached["halves"], cached["metrics"]
 
     t0 = time.time()
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
     t_pdf = time.time()
 
-    out_blocks = []
+    halves = []
+    blocks = []
     for p in pages:
         pp = preprocess(p, scale=scale, bin_thresh=bin_thresh)
-        out_blocks.append(ocr_fast_halves(pp))
+        lt, rt = ocr_fast_halves(pp)
+        halves.append((lt, rt))
+        blocks.append(lt + "\n" + rt)
     t_ocr = time.time()
 
-    text = normalize_cyrillic("\n".join(out_blocks))
+    full_text = normalize_cyrillic("\n".join(blocks))
     metrics = {
         "dur_raster_s": round(t_pdf - t0, 3),
         "dur_ocr_s": round(t_ocr - t_pdf, 3),
         "dur_total_s": round(t_ocr - t0, 3),
     }
-    OCR_CACHE.set_cached(key, {"text": text, "pages": len(pages), "metrics": metrics})
-    return text, len(pages), metrics
+    OCR_CACHE.set_cached(key, {"text": full_text, "pages": len(pages), "halves": halves, "metrics": metrics})
+    return full_text, len(pages), halves, metrics
 
-# ---------------------------- Скачивание PDF (с прогревом) ----------------------------
+# ---------------------------- Скачивание PDF ----------------------------
 
-async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> Tuple[Optional[bytes], Optional[str], List[str], Optional[str]]:
+async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int):
     tried: List[str] = []
     params = {"pdf_url": (pdf_url or "").strip(), "match_id": match_id, "season": season}
     if "khl.ru/documents/" in params["pdf_url"] and "/pdf/" not in params["pdf_url"]:
@@ -271,24 +276,13 @@ async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> T
 
     return None, None, tried, last_error
 
-# ---------------------------- Парсеры блоков (+ фаззи-правка) ----------------------------
-
-SECTION_PATTERNS = {
-    "goalies": r"(?:\bВратари\b[\s\S]{0,900})",
-    "refs": r"(?:\bСудьи\b|Главный судья|Линейный судья|Резервный(?: главный)? судья)[\s\S]{0,900}",
-    "lineups": r"(?:\bСоставы команд\b[\s\S]{0,5000})",
-}
-
-def extract_block(text: str, key: str) -> str:
-    m = re.search(SECTION_PATTERNS[key], text, flags=re.IGNORECASE)
-    return normalize_cyrillic(m.group(0) if m else "")
+# ---------------------------- Парсеры (по половинам) ----------------------------
 
 FIO_RE = re.compile(r"\b[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ]\.)?\b")
 
 def clean_possible_name(s: str) -> Optional[str]:
     s = re.sub(r"\s+", " ", s).strip()
-    # выкинуть номера, позиции и даты
-    s = re.sub(r"^\d+\s*\|\s*[ВЗН]\s*\|\s*", "", s)
+    s = re.sub(r"^\d+\s*\|\s*[ВЗН]\s*\|\s*", "", s)  # номер|позиция|...
     s = re.sub(r"\[\d{1,2}\.\d{1,2}\.\d{2,4}\]", "", s)
     s = re.sub(r"\(\d{1,2}\.\d{1,2}\.\d{2,4}\)", "", s)
     s = re.sub(r"\d{1,2}\.\d{1,2}\.\d{2,4}", "", s)
@@ -297,50 +291,77 @@ def clean_possible_name(s: str) -> Optional[str]:
     m = FIO_RE.search(s)
     return m.group(0) if m else None
 
-def parse_referees(block: str) -> List[Dict[str, str]]:
-    """
-    Ищем строки с ролями, затем берём следующие 1–2 строки как ФИО.
-    """
+def parse_referees_free(text_left: str, text_right: str) -> List[Dict[str,str]]:
+    """Ищем роли и ФИО в обеих половинах, без привязки к позициям игроков."""
+    roles = ["Главный судья", "Линейный судья", "Резервный главный судья", "Резервный судья"]
+    all_lines = [l.strip() for l in (text_left + "\n" + text_right).split("\n")]
     out = []
-    if not block: return out
-    lines = [l.strip() for l in block.split("\n") if l.strip()]
-    roles_idx = []
-    for i, ln in enumerate(lines):
-        if re.search(r"^(Главный судья|Линейный судья|Резервный(?: главный)? судья)\b", ln, flags=re.I):
-            roles_idx.append((i, re.sub(r".*?(Главный судья|Линейный судья|Резервный(?: главный)? судья).*", r"\1", ln, flags=re.I)))
+    for i, ln in enumerate(all_lines):
+        for role in roles:
+            if re.search(rf"^{role}\b", ln, flags=re.I):
+                # имя может быть в этой же строке или в ближайших 2 строках
+                candidates = [ln] + all_lines[i+1:i+3]
+                took = False
+                for c in candidates:
+                    nm = clean_possible_name(c)
+                    if nm:
+                        nm_fixed = best_match_name(nm, REFEREES_DICT, threshold=80)
+                        out.append({"role": role, "name": nm_fixed})
+                        took = True
+                        break
+                if not took:
+                    # если в строке нет имени, но есть два ФИО в следующих строках (иногда 2 главных)
+                    nxt = " ".join(all_lines[i+1:i+3])
+                    for m in FIO_RE.finditer(nxt):
+                        nm_fixed = best_match_name(m.group(0), REFEREES_DICT, threshold=80)
+                        out.append({"role": role, "name": nm_fixed})
+    # дедуп и ограничение: 2 главных, 2 линейных макс
+    def uniq_limit(items, key, limit):
+        seen, out2 = set(), []
+        for it in items:
+            k = (it["role"], it["name"])
+            if k in seen: continue
+            seen.add(k); out2.append(it)
+        # ограничим количество
+        res = []
+        counts = {}
+        for it in out2:
+            r = it["role"]
+            counts[r] = counts.get(r, 0) + 1
+            if r.startswith("Главный") and counts[r] > 2: continue
+            if r.startswith("Линейный") and counts[r] > 2: continue
+            res.append(it)
+        return res
+    return uniq_limit(out, "role", 2)
 
-    for idx, role in roles_idx:
-        # берём ближайшие 1-2 строки после роли
-        for j in range(idx+1, min(idx+3, len(lines))):
-            nm = clean_possible_name(lines[j])
-            if nm:
-                nm_fixed = best_match_name(nm, REFEREES_DICT, threshold=80)
-                out.append({"role": role, "name": nm_fixed})
-                break
-
-    # дедуп
-    seen, uniq = set(), []
-    for j in out:
-        k = (j["role"], j["name"])
-        if k in seen: continue
-        seen.add(k); uniq.append(j)
-    return uniq
-
-def parse_goalies(block: str) -> Dict[str, List[Dict[str, str]]]:
+def parse_goalies_by_halves(text_left: str, text_right: str) -> Dict[str, List[Dict[str,str]]]:
+    """Парсим вратарей в каждой половине независимо (ищем строки со столбцами или просто ФИО)."""
     res = {"home": [], "away": []}
-    if not block: return res
-    parts = re.split(r"\bВратари\b", block, flags=re.I)
-    cols = [p.strip() for p in parts[1:3] if p.strip()]
-    for idx, col in enumerate(cols):
-        side = "home" if idx == 0 else "away"
-        buf = " ".join(col.splitlines())
-        found, seen = [], set()
-        for m in FIO_RE.finditer(buf):
-            nm = m.group(0).strip()
-            nm = best_match_name(nm, PLAYERS_DICT, threshold=86)
-            if len(nm) >= 5 and nm not in seen:
-                seen.add(nm); found.append({"name": nm})
-        res[side] = found[:3]
+    def grab(side_text: str) -> List[Dict[str,str]]:
+        # сначала строки вида "NN | В | Фамилия Имя ..."
+        col_re = re.compile(r"\b\d+\s*\|\s*[ВV]\s*\|\s*([А-ЯЁ][^0-9\|\n]+)")
+        out = []
+        for m in col_re.finditer(side_text):
+            nm = clean_possible_name(m.group(1) or "")
+            if nm:
+                nm = best_match_name(nm, PLAYERS_DICT, threshold=86)
+                out.append({"name": nm})
+        # если не нашли — ищем просто ФИО рядом со словом "Вратари" или в верхней части блока
+        if not out:
+            blob = " ".join(side_text.splitlines()[:60])
+            for m in FIO_RE.finditer(blob):
+                nm = best_match_name(m.group(0), PLAYERS_DICT, threshold=86)
+                if nm not in [x["name"] for x in out]:
+                    out.append({"name": nm})
+        # ограничим до 3
+        uniq, seen = [], set()
+        for o in out:
+            if o["name"] in seen: continue
+            seen.add(o["name"]); uniq.append(o)
+        return uniq[:3]
+
+    res["home"] = grab(text_left)
+    res["away"] = grab(text_right)
     return res
 
 # ---------------------------- Модели ответа ----------------------------
@@ -368,13 +389,15 @@ class OCRResponse(BaseModel):
 
 @app.get("/")
 def root():
-    exists = {
-        "players_csv": os.path.exists("data/players.csv"),
-        "referees_csv": os.path.exists("data/referees.csv"),
-        "players_loaded": len(PLAYERS_DICT),
-        "refs_loaded": len(REFEREES_DICT),
+    return {
+        "ok": True, "service": "khl-pdf-ocr", "version": APP_VERSION, "ready": True,
+        "dicts": {
+            "players_path": DICT_SOURCES["players"],
+            "referees_path": DICT_SOURCES["referees"],
+            "players_loaded": len(PLAYERS_DICT),
+            "refs_loaded": len(REFEREES_DICT),
+        }
     }
-    return {"ok": True, "service": "khl-pdf-ocr", "version": APP_VERSION, "ready": True, "dicts": exists}
 
 @app.get("/ocr", response_model=OCRResponse)
 async def ocr_parse(
@@ -391,22 +414,19 @@ async def ocr_parse(
         pdf_bytes, final_url, tried, last_err = await fetch_pdf_with_fallback(pdf_url, match_id, season)
         if not pdf_bytes:
             return OCRResponse(ok=False, step="GET", status=404, match_id=match_id, season=season, tried=tried, error=last_err)
-
         t_pdf = time.time()
-        text, pages_cnt, metrics = run_ocr_pipeline(pdf_bytes, dpi, max_pages, scale, bin_thresh)
+        full_text, pages_cnt, halves, metrics = run_ocr_pipeline(pdf_bytes, dpi, max_pages, scale, bin_thresh)
         t_done = time.time()
-
-        snippet = re.sub(r"\s+", " ", text.strip())[:480]
+        snippet = re.sub(r"\s+", " ", full_text.strip())[:480]
         return OCRResponse(
-            ok=True,
-            match_id=match_id, season=season,
+            ok=True, match_id=match_id, season=season,
             source_pdf=final_url, pdf_len=len(pdf_bytes),
             dpi=dpi, pages_ocr=pages_cnt,
             dur_total_s=round(t_done - t0, 3),
             dur_download_s=round(t_pdf - t0, 3),
             dur_preproc_s=metrics["dur_raster_s"],
             dur_ocr_s=metrics["dur_ocr_s"],
-            text_len=len(text), snippet=snippet
+            text_len=len(full_text), snippet=snippet
         )
     except Exception as e:
         return OCRResponse(ok=False, step="OCR", status=500, match_id=match_id, season=season, error=f"{type(e).__name__}: {e}")
@@ -428,18 +448,22 @@ async def extract_structured(
         if not pdf_bytes:
             return {"ok": False, "step": "GET", "status": 404, "match_id": match_id, "season": season, "tried": tried, "error": last_err}
 
-        text, pages_cnt, metrics = run_ocr_pipeline(pdf_bytes, dpi, max_pages, scale, bin_thresh)
+        full_text, pages_cnt, halves, metrics = run_ocr_pipeline(pdf_bytes, dpi, max_pages, scale, bin_thresh)
+        # halves[0] -> (left_text, right_text) первой страницы
+        left_text = normalize_cyrillic(halves[0][0] if halves else "")
+        right_text = normalize_cyrillic(halves[0][1] if halves else "")
 
         keys = ["refs", "goalies", "lineups"] if target == "all" else [target]
         data: Dict[str, object] = {}
+
         for k in keys:
-            blk = extract_block(text, k)
             if k == "refs":
-                data["refs"] = parse_referees(blk)
+                data["refs"] = parse_referees_free(left_text, right_text)
             elif k == "goalies":
-                data["goalies"] = parse_goalies(blk)
+                data["goalies"] = parse_goalies_by_halves(left_text, right_text)
             elif k == "lineups":
-                data["lineups_raw"] = blk
+                # пока сырой текст обоих столбцов, для твоего дальнейшего парсинга звеньев
+                data["lineups_raw"] = left_text + "\n---RIGHT---\n" + right_text
 
         return {
             "ok": True,
@@ -450,7 +474,7 @@ async def extract_structured(
             "dur_download_s": metrics["dur_raster_s"],
             "dur_preproc_s": 0.0,
             "dur_ocr_s": metrics["dur_ocr_s"],
-            "text_len": len(text),
+            "text_len": len(full_text),
             "data": data,
         }
     except Exception as e:
