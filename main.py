@@ -241,13 +241,9 @@ def ocr_first_page(pdf_bytes: bytes, dpi: int = 200, scale: float = 1.25, bin_th
 # заголовок таблицы бывает разный: «Фамилия Имя», «Фамилия, Имя», со звёздочкой и т.п.
 HEADER_RE = re.compile(r"№\s+Поз\s+Фамилия,?\s*Имя(?:\s*\*)?\s+Д\.Р\.\s+Лет", re.I)
 
-RE_LINE = re.compile(
-    r"^\s*(?P<num>\d{1,2})\s+"
-    r"(?P<pos>[ВЗН])\s+"
-    r"(?P<name>[A-Za-zА-ЯЁа-яё\.\-\'\s]+?)"
-    r"(?:\s+(?P<capt>[AK]))?\s+"
-    r"(?P<dob>\d{2}\.\d{2}\.\d{4})\s+"
-    r"(?P<age>\d{1,2})\s*$"
+HEADER_RE = re.compile(
+    r"№\s*Поз\s*Фамилия,?\s*Имя(?:\s*\*?)?\s*Д\.?\s*Р\.?\s*Лет",
+    re.I
 )
 
 def split_blocks(left: str, right: str) -> Dict[str, str]:
@@ -286,30 +282,45 @@ def parse_goalies(block: str, side: str) -> List[Dict[str, str]]:
     return res
 
 def parse_refs(left: str, right: str) -> List[Dict[str, str]]:
-    blob = left + "\n" + right
+    blob = (left + "\n" + right).splitlines()
+    blob = [clean_text(x).strip() for x in blob]
     refs: List[Dict[str, str]] = []
 
-    # Главные судьи (две строки подряд после заголовка)
-    g = re.search(r"Главный\s+судья.*?\n(.+?)\n(.+?)\n", blob, flags=re.S | re.I)
-    if g:
-        a = normalize_tail_y(g.group(1)).strip()
-        b = normalize_tail_y(g.group(2)).strip()
-        a = dict_fix(a, _dict_refs)
-        b = dict_fix(b, _dict_refs)
-        if a: refs.append({"role": "Главный судья", "name": a})
-        if b: refs.append({"role": "Главный судья", "name": b})
+    # Собираем индексы заголовков
+    idx_main = [i for i,s in enumerate(blob) if re.search(r"Главный\s+судья", s, re.I)]
+    idx_line = [i for i,s in enumerate(blob) if re.search(r"Линейный\s+судья", s, re.I)]
 
-    # Линейные (две строки подряд)
-    l = re.search(r"Линейный\s+судья.*?\n(.+?)\n(.+?)\n", blob, flags=re.S | re.I)
-    if l:
-        a = normalize_tail_y(l.group(1)).strip()
-        b = normalize_tail_y(l.group(2)).strip()
-        a = dict_fix(a, _dict_refs)
-        b = dict_fix(b, _dict_refs)
-        if a: refs.append({"role": "Линейный судья", "name": a})
-        if b: refs.append({"role": "Линейный судья", "name": b})
+    def take_two_after(idx_list, role):
+        taken = 0
+        for i in idx_list:
+            # захватываем ближайшие 1-2 непустые строки после заголовка
+            j = i + 1
+            local = []
+            while j < len(blob) and len(local) < 2:
+                name = blob[j]
+                if name and not re.search(r"(Главный|Линейный)\s+судья", name, re.I):
+                    nm = normalize_tail_y(name)
+                    nm = dict_fix(nm, _dict_refs)
+                    if nm:
+                        local.append(nm)
+                j += 1
+            for nm in local:
+                refs.append({"role": role, "name": nm})
+            taken += len(local)
+        return taken
 
-    return refs
+    take_two_after(idx_main, "Главный судья")
+    take_two_after(idx_line, "Линейный судья")
+
+    # де-дуп (иногда одинаковая строка встречается слева и справа)
+    seen = set()
+    uniq = []
+    for r in refs:
+        key = (r["role"], r["name"])
+        if key not in seen:
+            uniq.append(r); seen.add(key)
+    return uniq
+
 
 def parse_lineups_block(text: str, side: str) -> List[Dict[str, Any]]:
     sink: List[Dict[str, Any]] = []
@@ -331,6 +342,13 @@ def parse_lineups_block(text: str, side: str) -> List[Dict[str, Any]]:
             elif name.endswith(" Р"): name, gk_flag, gk_status = name[:-2].strip(), "R", "reserve"
         name = normalize_tail_y(name)
         name = dict_fix(name, _dict_players)
+                # если метка капитана «A/K» прилипла в конец имени — вытащим
+        if not capt:
+            mcap = re.search(r"\s([AK])$", name)
+            if mcap:
+                capt = mcap.group(1)
+                name = name[:mcap.start()].strip()
+
         sink.append({
             "side": side, "num": num, "pos": pos, "name": name,
             "capt": capt, "dob": dob, "age": age,
