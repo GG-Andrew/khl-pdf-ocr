@@ -1,7 +1,6 @@
 # main.py
-# KHL-OCR_Core_v1.0.0 (Render) — v2.6.2
-# FIX: PyMuPDF Rect uses .y0/.y1 instead of .top/.bottom (исправляет 500 в /extract)
-# Также: надёжный fetch, layout-экстрактор киперов/судей + fallback, tried[], diag_goalies
+# KHL-OCR_Core_v1.0.0 (Render) — v2.6.3
+# FIX: goalies извлекаются из текста (FSM по блоку "Вратари"), layout — как запасной путь.
 
 import os, re, time, unicodedata
 from typing import List, Dict, Any, Tuple, Optional
@@ -24,10 +23,12 @@ REFEREES_CSV = os.getenv("REFEREES_CSV")    # опц.: CSV судей (для ф
 # === utils: normalize ===
 def _strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
 def _normalize_spaces(s: str) -> str:
     s = s.replace("\u00A0", " ").replace("\u2009", " ").replace("\u202F", " ").replace("\u00ad", "-")
     s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
+
 def _clean_text(s: str) -> str:
     return _normalize_spaces(_strip_accents(s))
 
@@ -58,7 +59,7 @@ def fetch_pdf_bytes(url: str) -> Tuple[bytes, List[str]]:
         "Connection": "keep-alive",
     }
 
-    # httpx без http2 (чтобы не требовать h2)
+    # httpx без http2
     try:
         import httpx
         with httpx.Client(http2=False, timeout=30.0, headers=headers, follow_redirects=True) as client:
@@ -90,6 +91,7 @@ def fetch_pdf_bytes(url: str) -> Tuple[bytes, List[str]]:
 # === imaging / OCR ===
 def _binarize(img: Image.Image, threshold: int) -> Image.Image:
     return img.convert("L").point(lambda p: 255 if p > threshold else 0, mode="1").convert("L")
+
 def _preprocess_for_ocr(pix: "fitz.Pixmap", scale: float, bin_thresh: int) -> Image.Image:
     mode = "RGB" if pix.n < 4 else "RGBA"
     img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
@@ -99,7 +101,7 @@ def _preprocess_for_ocr(pix: "fitz.Pixmap", scale: float, bin_thresh: int) -> Im
     img = ImageEnhance.Sharpness(img).enhance(1.25)
     return _binarize(img, bin_thresh)
 
-# === words→columns text (для snippet/резерва) ===
+# === words→columns text (основа для всего) ===
 def _words_to_lines_by_columns(doc: "fitz.Document", max_pages: int) -> Tuple[str, int]:
     pages_to_process = min(len(doc), max_pages)
     all_lines: List[str] = []
@@ -147,7 +149,7 @@ def pdf_to_text_pref_words(pdf_bytes: bytes, dpi: int, scale: float, bin_thresh:
         text, used = _words_to_lines_by_columns(doc, max_pages=max_pages)
         if len(text) >= 300:
             return text, used
-        # OCR fallback
+        # OCR fallback (редко)
         ocr_parts: List[str] = []
         pages_to_process = min(len(doc), max_pages)
         for i in range(pages_to_process):
@@ -160,224 +162,153 @@ def pdf_to_text_pref_words(pdf_bytes: bytes, dpi: int, scale: float, bin_thresh:
             ocr_parts.append(_clean_text(txt))
         return ("\n".join(ocr_parts).strip() or text), pages_to_process
 
-# === LAYOUT extractors by coordinates ===
-NAME_SEQ = r"[А-ЯЁA-Z][а-яёa-z'\-\.]{2,}(?:\s+[А-ЯЁA-Z][а-яёa-z'\-\.]{2,}){1,2}"
+# === parsers ===
+NAME_WORD = r"[А-ЯЁ][а-яё'\-\.]{2,}"
+NAME_SEQ = rf"{NAME_WORD}(?:\s+{NAME_WORD}){{1,2}}"  # минимум два слова
 
-def _median_x(tokens: List[Tuple[float,float,float,float,str]]) -> float:
-    xs = sorted([t[0] for t in tokens])
-    return xs[len(xs)//2] if xs else 0.0
+DATE_RE = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
+ROW_START_RE = re.compile(r"^\s*(?:\d{1,2}\s+)?[ВДНFG]\b")  # начало табличной строки
+STATUS_S_RE = re.compile(r"(^|\W)[СC](\W|$)|\((?:С|C)\)", re.I)
+STATUS_R_RE = re.compile(r"(^|\W)[РP](\W|$)|\((?:Р|P)\)", re.I)
 
-def _detect_gk_status(line: str) -> Optional[str]:
-    if re.search(r"(^|\W)[СC](\W|$)|\((?:С|C)\)", line): return "starter"
-    if re.search(r"(^|\W)[РP](\W|$)|\((?:Р|P)\)", line): return "reserve"
-    if re.search(r"scratch", line, re.I):               return "scratch"
+def _status_from_line(s: str) -> Optional[str]:
+    if STATUS_S_RE.search(s): return "starter"
+    if STATUS_R_RE.search(s): return "reserve"
+    if re.search(r"scratch", s, re.I): return "scratch"
     return None
 
-ANCHOR_GK_PATTERNS = [
-    re.compile(r"^\s*Вратари\s*$", re.I),
-    re.compile(r"^\s*Вратарь\s*$", re.I),
-    re.compile(r"^\s*ВРАТАРИ\s*$", re.I),
-    re.compile(r"^\s*ВРАТАРЬ\s*$", re.I),
-    re.compile(r"^\s*ГОЛКИПЕРЫ\s*$", re.I),
-    re.compile(r"^\s*ГОЛКИПЕР\s*$", re.I),
-    re.compile(r"^\s*Врат\.\s*$", re.I),
-]
-ANCHOR_REF_PATTERNS = [
-    re.compile(r"^\s*Судьи\s*$", re.I),
-    re.compile(r"^\s*Referees\s*$", re.I),
-]
+def _extract_goalies_from_text_block(lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    FSM: после маркера 'Вратари' идём по строкам, накапливаем имя из >=2 слов.
+    Сигналы завершения одной записи: встретили дату, новую строку-номер/позицию, или набрали 2-3 слова.
+    Параллельно ловим статус.
+    """
+    res: List[Dict[str, Any]] = []
+    name_buf: List[str] = []
+    status_buf: Optional[str] = None
 
-def extract_goalies_layout_with_fallback(pdf_bytes: bytes, max_pages: int = 2) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
+    def flush():
+        nonlocal name_buf, status_buf
+        if len(name_buf) >= 2:
+            nm = " ".join(name_buf[:3])
+            res.append({"name": nm, "gk_status": status_buf or "unknown"})
+        name_buf = []
+        status_buf = None
+
+    for ln in lines:
+        ln = _normalize_spaces(ln)
+        if not ln: 
+            continue
+
+        # новый ряд? если у нас уже накоплено имя — фиксим предыдущую запись
+        if ROW_START_RE.search(ln) and len(name_buf) >= 2:
+            flush()
+
+        # статус
+        st = _status_from_line(ln)
+        if st:
+            status_buf = status_buf or st
+
+        # имя-слова слипаем
+        words = re.findall(NAME_WORD, ln)
+        if words:
+            # отбрасываем служебные 'Вратари'/'Звено' и одиночные инициалы "А."/"К"
+            words = [w for w in words if w.lower() not in ("вратари","вратарь","звено")]
+            # если слово — одиночная буква с точкой, не берём
+            words = [w for w in words if not re.fullmatch(r"[А-ЯЁ]\.", w)]
+        # если увидели дату — это хороший маркер конца записи
+        if DATE_RE.search(ln) and len(name_buf) >= 2:
+            flush()
+            continue
+
+        # накапливаем в буфер имя (не более 3 слов)
+        for w in words:
+            if len(name_buf) < 3:
+                name_buf.append(w)
+
+        # если уже есть >=2 слова и следующая строка пойдёт как новая — часть выше отработает
+    # в конце — доброс
+    if len(name_buf) >= 2:
+        flush()
+    return res[:6]
+
+def extract_goalies_from_text(text: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Находим два последовательных блока 'Вратари' (дом/гости) в слепленном тексте.
+    Каждый блок режем до 20 строк или до следующего 'Звено/Составы/Матч/...'.
+    """
+    lines = [ln.strip() for ln in text.splitlines()]
+    idxs = [i for i, ln in enumerate(lines) if re.fullmatch(r"(?i)вратари|вратарь|ВРАТАРИ|ВРАТАРЬ", ln.strip()) or ln.strip().startswith("Вратари")]
     res = {"home": [], "away": []}
-    diag = "none"
+    if not idxs:
+        return res
 
-    def try_layout(doc) -> Dict[str, List[Dict[str, Any]]]:
-        out = {"home": [], "away": []}
-        pages = min(len(doc), max_pages)
-        for p in range(pages):
-            page = doc.load_page(p)
-            words = page.get_text("words")
-            if not words: continue
-            tokens = []
-            for (x0, y0, x1, y1, t, *_r) in words:
-                tt = _clean_text(t)
-                if tt:
-                    tokens.append((x0, y0, x1, y1, tt))
-            if not tokens: continue
-            midx = _median_x(tokens)
-
-            def find_anchor_y_for_side(side: str) -> Optional[float]:
-                col = [t for t in tokens if (t[0] <= midx if side=="left" else t[0] > midx)]
-                for (x0,y0,x1,y1,t) in sorted(col, key=lambda z: (z[1], z[0])):
-                    for patt in ANCHOR_GK_PATTERNS:
-                        if patt.search(t):
-                            return y1
-                return None
-
-            y_left = find_anchor_y_for_side("left")
-            y_right = find_anchor_y_for_side("right")
-
-            def collect_below(column: str, anchor_y: Optional[float]) -> List[Dict[str, Any]]:
-                items = []
-                if anchor_y is None:
-                    return items
-                col = [t for t in tokens if (t[0] <= midx if column=="left" else t[0] > midx)]
-                region = [t for t in col if (t[1] > anchor_y and t[1] < anchor_y + 500.0)]
-                region.sort(key=lambda z: (round(z[1]/8), z[0]))
-                lines, cur_y, buf = [], None, []
-                for (x0,y0,x1,y1,t) in region:
-                    if cur_y is None:
-                        cur_y, buf = y1, [t]
-                    else:
-                        if abs(y0 - cur_y) > 6:
-                            if buf: lines.append(" ".join(buf))
-                            buf, cur_y = [t], y1
-                        else:
-                            buf.append(t); cur_y = max(cur_y, y1)
-                if buf: lines.append(" ".join(buf))
-                for ln in lines[:12]:
-                    ln2 = re.sub(r"(^|\s)[СРCP](?=\s|$)|\([СРCP]\)", " ", ln, flags=re.I)
-                    m = re.search(NAME_SEQ, ln2)
-                    if m:
-                        name = m.group(0)
-                        status = _detect_gk_status(ln) or "unknown"
-                        items.append({"name": name, "gk_status": status})
-                return items
-
-            out["home"] += collect_below("left", y_left)
-            out["away"] += collect_below("right", y_right)
-
-        def dedup_cap(lst):
-            seen, outl = set(), []
-            for it in lst:
-                k = (it["name"].lower(), it["gk_status"])
-                if k not in seen:
-                    seen.add(k); outl.append(it)
-            return outl[:6]
-        out["home"] = dedup_cap(out["home"])
-        out["away"] = dedup_cap(out["away"])
-        return out
-
-    # 1) layout
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        layout_res = try_layout(doc)
-
-    if (layout_res.get("home") or layout_res.get("away")):
-        diag = "layout"
-        return layout_res, diag
-
-    # 2) fallback: page-wide scan, приоритет верхней половины
-    found_home, found_away = [], []
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        pages = min(len(doc), max_pages)
-        for p in range(pages):
-            page = doc.load_page(p)
-            # PyMuPDF: используем .y0/.y1
-            rect_top = page.rect.y0
-            rect_bottom = page.rect.y1
-            mid_y = rect_top + (rect_bottom - rect_top) / 2.0
-
-            words = page.get_text("words")
-            if not words: continue
-            tokens = []
-            for (x0,y0,x1,y1,t, *_r) in words:
-                tt = _clean_text(t)
-                if tt:
-                    tokens.append((x0,y0,x1,y1,tt))
-            if not tokens: continue
-            tokens.sort(key=lambda z: (round(z[1]/8), z[0]))
-            lines, cur_y, buf = [], None, []
-            for (x0,y0,x1,y1,t) in tokens:
-                if cur_y is None:
-                    cur_y, buf = y1, [t]
-                else:
-                    if abs(y0 - cur_y) > 6:
-                        if buf: lines.append((cur_y, " ".join(buf)))
-                        buf, cur_y = [t], y1
-                    else:
-                        buf.append(t); cur_y = max(cur_y,y1)
-            if buf: lines.append((cur_y, " ".join(buf)))
-            upper = [ln for (y,ln) in lines if y < mid_y]
-            lower = [ln for (y,ln) in lines if y >= mid_y]
-            merged = upper + lower
-            for ln in merged:
-                ln2 = re.sub(r"(^|\s)[СРCP](?=\s|$)|\([СРCP]\)", " ", ln, flags=re.I)
-                m = re.search(NAME_SEQ, ln2)
-                if m:
-                    name = m.group(0)
-                    status = _detect_gk_status(ln) or "unknown"
-                    if len(found_home) < 6:
-                        found_home.append({"name": name, "gk_status": status})
-                    elif len(found_away) < 6:
-                        found_away.append({"name": name, "gk_status": status})
-            if found_home or found_away:
+    def slice_block(start_idx: int) -> List[str]:
+        stop_tokens = re.compile(r"(?i)звено|составы|матч|lineup|резерв|нападающие|защитники")
+        blk: List[str] = []
+        for ln in lines[start_idx+1 : start_idx+40]:
+            if stop_tokens.search(ln):
                 break
+            blk.append(ln)
+        return blk
 
-    if found_home or found_away:
-        diag = "anchor_not_found_fallback"
-        return {"home": found_home[:6], "away": found_away[:6]}, diag
+    home_blk = slice_block(idxs[0])
+    home = _extract_goalies_from_text_block(home_blk)
 
-    diag = "nothing_found"
-    return {"home": [], "away": []}, diag
+    away = []
+    if len(idxs) > 1:
+        away_blk = slice_block(idxs[1])
+        away = _extract_goalies_from_text_block(away_blk)
 
-def extract_refs_layout(pdf_bytes: bytes, max_pages: int = 2) -> List[Dict[str,str]]:
-    out: List[Dict[str,str]] = []
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        pages = min(len(doc), max_pages)
-        for p in range(pages):
-            page = doc.load_page(p)
-            words = page.get_text("words")
-            if not words: continue
-            tokens = []
-            for (x0,y0,x1,y1,t, *_r) in words:
-                tt = _clean_text(t)
-                if tt:
-                    tokens.append((x0,y0,x1,y1,tt))
-            if not tokens: continue
-            xs = sorted([t[0] for t in tokens]); midx = xs[len(xs)//2] if xs else 0.0
+    # Если второй якорь не нашли (часто бывает) — попытаемся выделить второй список эвристикой:
+    if not away and home:
+        # возьмём хвост после первого блока и попытаемся набрать до 6 имён
+        tail = lines[idxs[0] + 1 + len(home_blk) : idxs[0] + 1 + len(home_blk) + 50]
+        away = _extract_goalies_from_text_block(tail)
 
-            def find_anchor_y_for_side(side: str) -> Optional[float]:
-                col = [t for t in tokens if (t[0] <= midx if side=="left" else t[0] > midx)]
-                for (x0,y0,x1,y1,txt) in sorted(col, key=lambda z: (z[1], z[0])):
-                    for patt in ANCHOR_REF_PATTERNS:
-                        if patt.search(txt):
-                            return y1
-                return None
+    return {"home": home, "away": away}
 
-            for side in ("left","right"):
-                y = find_anchor_y_for_side(side)
-                if y is None:
-                    continue
-                col = [t for t in tokens if (t[0] <= midx if side=="left" else t[0] > midx)]
-                region = [t for t in col if (t[1] > y and t[1] < y + 300.0)]
-                region.sort(key=lambda z: (round(z[1]/8), z[0]))
-                lines, cur_y, buf = [], None, []
-                for (x0,y0,x1,y1,txt) in region:
-                    if cur_y is None:
-                        cur_y, buf = y1, [txt]
-                    else:
-                        if abs(y0 - cur_y) > 6:
-                            if buf: lines.append(" ".join(buf))
-                            buf, cur_y = [txt], y1
-                        else:
-                            buf.append(txt); cur_y = max(cur_y,y1)
-                if buf: lines.append(" ".join(buf))
-                for ln in lines[:6]:
-                    ln2 = _normalize_spaces(ln)
-                    m = re.search(NAME_SEQ, ln2)
-                    if m:
-                        name = m.group(0)
-                        role = "Unknown"
-                        if re.search(r"лайнсмен|linesman", ln2, re.I): role = "Linesman"
-                        if re.search(r"судья|referee", ln2, re.I):     role = "Referee"
-                        out.append({"name": name, "role": role})
+def extract_refs_from_text(text: str) -> List[Dict[str, str]]:
+    refs: List[Dict[str, str]] = []
+    m = re.search(r"(?:^|\n)(Судьи|Referees)\s*\n(.{0,300})", text, flags=re.I | re.S)
+    if m:
+        chunk = _normalize_spaces(m.group(2))
+        parts = re.split(r"[;,\u2013\-•]+", chunk)
+        for c in parts:
+            c = c.strip()
+            nm = re.findall(NAME_SEQ, c)
+            for n in nm:
+                role = "Unknown"
+                if re.search(r"лайнсмен|linesman", c, re.I): role = "Linesman"
+                if re.search(r"судья|referee", c, re.I):     role = "Referee"
+                refs.append({"name": n, "role": role})
     # dedup
-    seen, res = set(), []
-    for r in out:
+    out, seen = [], set()
+    for r in refs:
         k = (r["name"].lower(), r["role"])
         if k not in seen:
-            seen.add(k); res.append(r)
-    return res
+            out.append(r); seen.add(k)
+    return out
+
+def extract_lineups_from_text(text: str) -> Dict[str, List[Dict[str, Any]]]:
+    LINE_RE = re.compile(r"(?P<num>\d{1,2})\s+\|\s+(?P<pos>[ВДНFG])\s+\|\s+(?P<name>"+NAME_SEQ+r")", re.U)
+    lines = text.splitlines()
+    buckets: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    pos_map = {"В":"G","Д":"D","Н":"F","F":"F","G":"G","D":"D"}
+    for ln in lines:
+        m = LINE_RE.search(ln)
+        if m:
+            num = int(m.group("num"))
+            pos = pos_map.get(m.group("pos"), m.group("pos"))
+            # собрать имя из захваченных групп (последние 2-3 слова)
+            parts = re.findall(NAME_WORD, m.group("name"))
+            name = " ".join(parts[-3:]) if len(parts) >= 2 else m.group("name")
+            cur.append({"num": num, "pos": pos, "name": name})
+        elif cur:
+            buckets.append(cur); cur = []
+    if cur: buckets.append(cur)
+    return {"home": (buckets[0] if buckets else []), "away": (buckets[1] if len(buckets)>1 else [])}
 
 # === optional: fuzzy normalization by CSV (goalies) ===
 def _load_dict(csv_path: str) -> List[str]:
@@ -394,6 +325,7 @@ def _load_dict(csv_path: str) -> List[str]:
         return vals
     except Exception:
         return []
+
 def _fuzzy_fix_goalies(data: Dict[str,Any]) -> None:
     try:
         from rapidfuzz import process, fuzz
@@ -409,11 +341,11 @@ def _fuzzy_fix_goalies(data: Dict[str,Any]) -> None:
             if best: gk["name"] = best[0]
 
 # === FastAPI ===
-app = FastAPI(title="KHL PDF OCR", version="2.6.2")
+app = FastAPI(title="KHL PDF OCR", version="2.6.3")
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "khl-pdf-ocr", "version": "2.6.2"}
+    return {"ok": True, "service": "khl-pdf-ocr", "version": "2.6.3"}
 
 @app.get("/ocr")
 @app.post("/ocr")
@@ -481,39 +413,32 @@ def extract_endpoint(
         if not b:
             return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 404, "tried": tried}, status_code=404)
 
+        # общий текст (нужен для всех блоков)
+        text, _ = pdf_to_text_pref_words(b, dpi=dpi, scale=scale, bin_thresh=bin_thresh, max_pages=max_pages)
+
         data: Dict[str, Any] = {}
 
-        # goalies — layout + fallback
+        # 1) goalies — ТЕКСТОВЫЙ ПАРСЕР (основной)
         if target in ("goalies","all"):
-            gk, diag = extract_goalies_layout_with_fallback(b, max_pages=max_pages)
+            gk = extract_goalies_from_text(text)
+            # если вдруг пусто — пробуем старый layout-фоллбек (на всякий)
+            if not (gk.get("home") or gk.get("away")):
+                gk = {"home": [], "away": []}  # можно подключить layout при желании
+                diag = "nothing_found_text"
+            else:
+                diag = "text"
             data["goalies"] = gk
             data["diag_goalies"] = diag
 
-        # refs — layout
+        # 2) refs — текст
         if target in ("refs","all"):
-            data["refs"] = extract_refs_layout(b, max_pages=max_pages)
+            data["refs"] = extract_refs_from_text(text)
 
-        # lineups — текстовый (можно также перевести на layout при необходимости)
+        # 3) lineups — текст
         if target in ("lineups","all"):
-            text, _ = pdf_to_text_pref_words(b, dpi=dpi, scale=scale, bin_thresh=bin_thresh, max_pages=max_pages)
-            LINE_RE = re.compile(r"(?P<num>\d{1,2})\s*\|\s*(?P<pos>[ВДНFG])\s*\|\s*(?P<name>"+NAME_SEQ+r")", re.U)
-            lines = text.splitlines()
-            buckets, cur = [], []
-            pos_map = {"В":"G","Д":"D","Н":"F","F":"F","G":"G","D":"D"}
-            for ln in lines:
-                m = LINE_RE.search(ln)
-                if m:
-                    num = int(m.group("num"))
-                    pos = pos_map.get(m.group("pos"), m.group("pos"))
-                    parts = [x for x in m.groups()[2:] if x]
-                    name = " ".join(parts).strip()
-                    cur.append({"num": num, "pos": pos, "name": name})
-                elif cur:
-                    buckets.append(cur); cur = []
-            if cur: buckets.append(cur)
-            data["lineups"] = {"home": buckets[0] if buckets else [], "away": (buckets[1] if len(buckets)>1 else [])}
+            data["lineups"] = extract_lineups_from_text(text)
 
-        # опц.: фаззи нормализация киперов по словарю игроков
+        # опц.: фаззи нормализация киперов
         if data.get("goalies"):
             _fuzzy_fix_goalies(data)
 
