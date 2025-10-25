@@ -1,9 +1,10 @@
 # main.py
-# KHL PDF OCR Server — v2.2.0
+# KHL PDF OCR Server — v2.2.1
 # - Быстрый парсинг текст-слоя (PyMuPDF)
 # - Координатная разметка колонок: № | Поз | Фамилия Имя | Д.Р. | Лет
 # - Безопасная коррекция ФИО (без кросс-командных подстановок)
 # - Метки вратарей: gk_flag ("S"/"R") и gk_status ("starter"/"reserve"/None)
+# - Goalies: дополнение статуса "scratch" для третьего без метки
 # - Улучшенный парсер судей (поддержка повторов ролей)
 #
 # Endpoints:
@@ -21,7 +22,7 @@
 #   pillow
 #   pytesseract
 
-import os, re, time, csv
+import os, re, time, csv, unicodedata
 from typing import List, Dict, Optional, Tuple
 
 import httpx
@@ -36,8 +37,12 @@ import pytesseract
 
 from rapidfuzz import process, fuzz
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 DEFAULT_SEASON = 1369
+
+# Поведение нормализации
+STRIP_ACCENTS = True          # снять ударения в именах
+USE_DICTIONARIES = True       # использовать словари players/referees для мягкой коррекции
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
 
@@ -60,7 +65,6 @@ PDF_TEMPLATES = [
 PLAYERS_DICT: List[str] = []
 REFEREES_DICT: List[str] = []
 DICT_SOURCES: Dict[str, str] = {"players": "", "referees": ""}
-USE_DICTIONARIES = True  # поставь False, чтобы полностью игнорировать словари
 
 def _find_path(cands: List[str]) -> Optional[str]:
     for p in cands:
@@ -95,7 +99,6 @@ def _load_names(path: Optional[str]) -> List[str]:
                     if s: names.append(s)
     except Exception:
         pass
-    # нормализация регистра
     out = []
     for n in names:
         s = re.sub(r"\s+"," ",n).strip()
@@ -115,10 +118,14 @@ def load_dicts():
     REFEREES_DICT = _load_names(rr)
 load_dicts()
 
+def strip_accents(s: str) -> str:
+    if not s: return s
+    return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+
 def best_match(name: str, pool: List[str], th: int = 96) -> str:
     """
     Безопасная коррекция ФИО:
-    - если словарь выключен/пустой → вернуть как есть;
+    - если словарь пустой → вернуть как есть;
     - правим только при очень высокой похожести (>=96) и
       совпадении первых букв фамилии и имени; длина почти совпадает.
     """
@@ -180,7 +187,7 @@ POS_RE = re.compile(r"^[ВЗН]$")
 def norm(s: str) -> str:
     if not s: return s
     s = s.translate(LAT_TO_CYR)
-    s = re.sub(r"([А-ЯЁ][а-яё]{2,})([А-ЯЁ][а-яё]{2,})", r"\1 \2", s)
+    s = re.sub(r"([А-ЯЁ][а-яё]{2,})([А-ЯЁ][a-яё]{2,})", r"\1 \2", s)
     s = re.sub(r"[ \t]+"," ",s).strip()
     return s
 
@@ -274,7 +281,6 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
     buckets = {"num": [], "pos": [], "name": [], "dob": [], "age": []}
 
     for x0,y0,x1,y1,t in row:
-        # приоритет по содержимому
         if DATE_RE.match(t):
             buckets["dob"].append(t); 
             continue
@@ -310,14 +316,15 @@ def row_to_player(row, cols, side: str) -> Optional[Dict[str,str]]:
         elif t in ("Р","P","R"):
             gk_flag = "R"
 
-    # имя: исключаем служебные одиночные буквы (A/K/S/R и т.п.)
     IGNORE = {"А","A","К","K","С","C","S","Р","P","R","*","·",","}
     name_tokens = [t for t in buckets["name"] if t not in IGNORE and not re.fullmatch(r"[A-Za-zА-Яа-яЁё]\.?$", t)]
     raw_name = " ".join(name_tokens).strip(" ,*")
     raw_name = raw_name.replace(" ,", ",").replace(", ", " ")
     m = FIO_RE.search(raw_name)
     name = m.group(0) if m else raw_name
-    name = best_match(name, PLAYERS_DICT)  # безопасная коррекция
+    if STRIP_ACCENTS:
+        name = strip_accents(name)
+    name = best_match(name, PLAYERS_DICT)
 
     dob = next((w for w in buckets["dob"] if DATE_RE.match(w)), "")
     age = next((re.sub(r"\D","",w) for w in buckets["age"] if re.search(r"\d", w)), "")
@@ -377,29 +384,28 @@ def parse_refs_from_text(lt: str, rt: str) -> List[Dict[str,str]]:
             i += 1
             continue
 
-        # сколько раз роль повторяется подряд на этой строке
         repeats = len(re.findall(rf"{matched}", ln))
-        # и на следующих строках (когда пишут вторую роль на новой строке)
         j = i + 1
         while j < len(lines) and re.fullmatch(rf"{matched}\b", lines[j]):
             repeats += 1
             j += 1
 
-        # забираем столько имён, сколько повторов роли
         names = []
         k = j
         while k < len(lines) and len(names) < repeats and (k - j) < 6:
             nm = FIO_RE.search(lines[k])
             if nm:
-                names.append(best_match(nm.group(0), REFEREES_DICT))
+                nm_txt = nm.group(0)
+                if STRIP_ACCENTS:
+                    nm_txt = strip_accents(nm_txt)
+                names.append(best_match(nm_txt, REFEREES_DICT))
             k += 1
 
         for nm in names:
             out.append({"role": matched, "name": nm})
 
-        i = k  # перескочили за обработанный блок
+        i = k
 
-    # дедуп
     seen, res = set(), []
     for j in out:
         key = (j["role"], j["name"])
@@ -538,19 +544,36 @@ async def extract_structured(
     for k in keys:
         if k == "refs":
             data["refs"] = parse_refs_from_text(lt, rt)
+
         elif k == "lineups":
             data["lineups"] = {"home": home_players or [], "away": away_players or []}
+
         elif k == "goalies":
             def map_goalies(players):
                 arr = []
                 for p in players or []:
                     if p.get("pos") == "В":
                         status = p.get("gk_status") or "unknown"
-                        arr.append({"name": p.get("name",""), "status": status})
-                # сортировка: starter -> unknown -> reserve
-                order = {"starter": 0, "unknown": 1, "reserve": 2}
+                        nm = p.get("name","")
+                        # финальная мягкая коррекция/очистка имени:
+                        if STRIP_ACCENTS:
+                            nm = strip_accents(nm)
+                        nm = best_match(nm, PLAYERS_DICT)
+                        arr.append({"name": nm, "status": status})
+
+                # если есть и starter, и reserve — остальные unknown считаем scratch
+                has_s = any(g["status"] == "starter" for g in arr)
+                has_r = any(g["status"] == "reserve" for g in arr)
+                if has_s and has_r:
+                    for g in arr:
+                        if g["status"] == "unknown":
+                            g["status"] = "scratch"
+
+                # сортировка: starter -> unknown/scratch -> reserve
+                order = {"starter": 0, "unknown": 1, "scratch": 1, "reserve": 2}
                 arr.sort(key=lambda x: order.get(x["status"], 1))
                 return arr
+
             data["goalies"] = {"home": map_goalies(home_players), "away": map_goalies(away_players)}
 
     return {
