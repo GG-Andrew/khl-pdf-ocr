@@ -209,72 +209,199 @@ def _detect_gk_status(line: str) -> Optional[str]:
     if re.search(r"scratch", line, re.I):               return "scratch"
     return None
 
-def extract_goalies_layout(pdf_bytes: bytes, max_pages: int = 2) -> Dict[str, List[Dict[str, Any]]]:
+# === REPLACEMENT: robust layout-based goalie extractor with fallback ===
+def extract_goalies_layout_with_fallback(pdf_bytes: bytes, max_pages: int = 2) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
+    """
+    1) Пытаемся layout-based: ищем якорь 'Вратари' (и варианты) в левой/правой колонке,
+       берём строки ниже якоря в колонке — собираем ФИО (>=2 слов) + gk_status.
+    2) Если результат пустой — fallback: page-wide scan -> агрегация линий с ФИО >=2 слов в верхней половине страницы.
+    Возвращает (result_dict, diag) — diag один из: "layout", "anchor_not_found_fallback", "ocr_only" (если пришлось OCR).
+    """
     res = {"home": [], "away": []}
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+    diag = "none"
+
+    ANCHOR_PATTERNS = [
+        re.compile(r"^\s*Вратари\s*$", re.I),
+        re.compile(r"^\s*Вратарь\s*$", re.I),
+        re.compile(r"^\s*ВРАТАРИ\s*$", re.I),
+        re.compile(r"^\s*ВРАТАРЬ\s*$", re.I),
+        re.compile(r"^\s*ГОЛКИПЕРЫ\s*$", re.I),
+        re.compile(r"^\s*ГОЛКИПЕР\s*$", re.I),
+        re.compile(r"^\s*Врат\.\s*$", re.I),
+    ]
+
+    def try_layout(doc) -> Dict[str, List[Dict[str, Any]]]:
+        out = {"home": [], "away": []}
         pages = min(len(doc), max_pages)
-        for i in range(pages):
-            page = doc.load_page(i)
+        for p in range(pages):
+            page = doc.load_page(p)
             words = page.get_text("words")
             if not words: continue
             tokens = []
-            for (x0,y0,x1,y1,t, *_rest) in words:
+            for (x0, y0, x1, y1, t, *_r) in words:
                 tt = _clean_text(t)
-                if tt: tokens.append((x0,y0,x1,y1,tt))
+                if tt:
+                    tokens.append((x0, y0, x1, y1, tt))
             if not tokens: continue
             midx = _median_x(tokens)
 
-            # Якорь "Вратари"
-            re_gk = re.compile(r"^Вратари$", re.I)
-            y_home = _find_anchor_y(tokens, re_gk, "left",  midx)
-            y_away = _find_anchor_y(tokens, re_gk, "right", midx)
+            # find anchors for left/right
+            def find_anchor_y_for_side(side: str) -> Optional[float]:
+                col = [t for t in tokens if (t[0] <= midx if side=="left" else t[0] > midx)]
+                for (x0,y0,x1,y1,t) in sorted(col, key=lambda z: (z[1], z[0])):
+                    for patt in ANCHOR_PATTERNS:
+                        if patt.search(t):
+                            return y1
+                return None
 
-            # Собираем кандидатов имён и статус по строке
-            def pack(column: str, y_anchor: Optional[float]) -> List[Dict[str,Any]]:
-                out: List[Dict[str,Any]] = []
-                if y_anchor is None: return out
-                # Соберём строки в зоне интереса и одновременно держим «сырые строки» для статуса
+            y_left = find_anchor_y_for_side("left")
+            y_right = find_anchor_y_for_side("right")
+
+            def collect_below(column: str, anchor_y: Optional[float]) -> List[Dict[str, Any]]:
+                items = []
+                if anchor_y is None:
+                    return items
                 col = [t for t in tokens if (t[0] <= midx if column=="left" else t[0] > midx)]
-                region = [t for t in col if (t[1] > y_anchor and t[1] < y_anchor + 500.0)]
+                region = [t for t in col if (t[1] > anchor_y and t[1] < anchor_y + 500.0)]
                 region.sort(key=lambda z: (round(z[1]/8), z[0]))
                 lines, cur_y, buf = [], None, []
                 for (x0,y0,x1,y1,t) in region:
                     if cur_y is None:
                         cur_y, buf = y1, [t]
                     else:
-                        if abs(y0-cur_y) > 6:
+                        if abs(y0 - cur_y) > 6:
                             if buf: lines.append(" ".join(buf))
                             buf, cur_y = [t], y1
                         else:
-                            buf.append(t); cur_y = max(cur_y,y1)
+                            buf.append(t); cur_y = max(cur_y, y1)
                 if buf: lines.append(" ".join(buf))
-                lines = [_normalize_spaces(ln) for ln in lines if ln.strip()]
-
-                for ln in lines[:12]:  # ограничим разумным числом строк
-                    # имя (≥2 слова)
+                for ln in lines:
                     ln2 = re.sub(r"(^|\s)[СРCP](?=\s|$)|\([СРCP]\)", " ", ln, flags=re.I)
                     m = re.search(NAME_SEQ, ln2)
-                    if not m: 
-                        continue
+                    if m:
+                        name = m.group(0)
+                        status = _detect_gk_status(ln) or "unknown"
+                        items.append({"name": name, "gk_status": status})
+                return items
+
+            out["home"] += collect_below("left", y_left)
+            out["away"] += collect_below("right", y_right)
+
+        # dedup & cap
+        def dedup_cap(lst):
+            seen, outl = set(), []
+            for it in lst:
+                k = (it["name"].lower(), it["gk_status"])
+                if k not in seen:
+                    seen.add(k); outl.append(it)
+            return outl[:6]
+        out["home"] = dedup_cap(out["home"])
+        out["away"] = dedup_cap(out["away"])
+        return out
+
+    # Try layout approach
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        layout_res = try_layout(doc)
+
+    # If we found anything → layout success
+    if (layout_res.get("home") or layout_res.get("away")):
+        diag = "layout"
+        return layout_res, diag
+
+    # --- Anchor not found fallback: page-wide scan for NAME_SEQ (upper half prioritized) ---
+    # We'll scan pages and collect lines that contain NAME_SEQ (>=2 words), preferring those in upper half
+    found_home, found_away = [], []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        pages = min(len(doc), max_pages)
+        for p in range(pages):
+            page = doc.load_page(p)
+            rect_top = page.rect.top
+            rect_bottom = page.rect.bottom
+            mid_y = rect_top + (rect_bottom - rect_top) / 2.0
+            words = page.get_text("words")
+            if not words: continue
+            tokens = []
+            for (x0,y0,x1,y1,t, *_r) in words:
+                tt = _clean_text(t)
+                if tt:
+                    tokens.append((x0,y0,x1,y1,tt))
+            if not tokens: continue
+            # build lines full-page
+            tokens.sort(key=lambda z: (round(z[1]/8), z[0]))
+            lines, cur_y, buf = [], None, []
+            for (x0,y0,x1,y1,t) in tokens:
+                if cur_y is None:
+                    cur_y, buf = y1, [t]
+                else:
+                    if abs(y0 - cur_y) > 6:
+                        if buf: lines.append((cur_y, " ".join(buf)))
+                        buf, cur_y = [t], y1
+                    else:
+                        buf.append(t); cur_y = max(cur_y,y1)
+            if buf: lines.append((cur_y, " ".join(buf)))
+            # prioritize lines above mid_y (upper half) then below
+            upper = [ln for (y,ln) in lines if y < mid_y]
+            lower = [ln for (y,ln) in lines if y >= mid_y]
+            merged = upper + lower
+            for ln in merged:
+                ln_clean = _normalize_spaces(re.sub(r"(^|\s)[СРCP](?=\s|$)|\([СРCP]\)", " ", ln, flags=re.I))
+                m = re.search(NAME_SEQ, ln_clean)
+                if m:
                     name = m.group(0)
                     status = _detect_gk_status(ln) or "unknown"
-                    out.append({"name": name, "gk_status": status})
-                return out
+                    # Heuristic assignment: first detected names → home, next chunk → away, cap 6 each
+                    if len(found_home) < 6:
+                        found_home.append({"name": name, "gk_status": status})
+                    elif len(found_away) < 6:
+                        found_away.append({"name": name, "gk_status": status})
+            if found_home or found_away:
+                # if found across pages, break early to avoid noise
+                break
 
-            res["home"] += pack("left",  y_home)
-            res["away"] += pack("right", y_away)
+    if found_home or found_away:
+        diag = "anchor_not_found_fallback"
+        res["home"] = found_home[:6]
+        res["away"] = found_away[:6]
+        return res, diag
 
-    # Дедуп по имени + статусу, сохраняем порядок
-    def dedup(lst):
-        seen, out = set(), []
-        for it in lst:
-            key = (it["name"].lower(), it["gk_status"])
-            if key not in seen:
-                seen.add(key); out.append(it)
-        return out[:6]  # ограничим до первых валидных записей
-    res["home"] = dedup(res["home"])
-    res["away"] = dedup(res["away"])
-    return res
+    # Final fallback: try OCR-only approach (render pages -> pytesseract -> scan for NAME_SEQ)
+    # This is heavier and used only if layout & page-wide name scan failed
+    ocr_names_home, ocr_names_away = [], []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        pages = min(len(doc), max_pages)
+        for p in range(pages):
+            page = doc.load_page(p)
+            zoom = DEFAULT_DPI / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = _preprocess_for_ocr(pix, scale=DEFAULT_SCALE, bin_thresh=DEFAULT_BIN_THRESH)
+            txt = pytesseract.image_to_string(img, lang="rus+eng", config="--oem 1 --psm 4 -c preserve_interword_spaces=1")
+            txt = _clean_text(txt)
+            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+            for ln in lines:
+                ln2 = re.sub(r"(^|\s)[СРCP](?=\s|$)|\([СРCP]\)", " ", ln, flags=re.I)
+                m = re.search(NAME_SEQ, ln2)
+                if m:
+                    name = m.group(0)
+                    status = _detect_gk_status(ln) or "unknown"
+                    if len(ocr_names_home) < 6:
+                        ocr_names_home.append({"name": name, "gk_status": status})
+                    elif len(ocr_names_away) < 6:
+                        ocr_names_away.append({"name": name, "gk_status": status})
+            if ocr_names_home or ocr_names_away:
+                break
+
+    if ocr_names_home or ocr_names_away:
+        diag = "ocr_only"
+        res["home"] = ocr_names_home[:6]
+        res["away"] = ocr_names_away[:6]
+        return res, diag
+
+    # nothing found at all
+    diag = "nothing_found"
+    return {"home": [], "away": []}, diag
+# === /END replacement ===
+
 
 def extract_refs_layout(pdf_bytes: bytes, max_pages: int = 2) -> List[Dict[str,str]]:
     out: List[Dict[str,str]] = []
