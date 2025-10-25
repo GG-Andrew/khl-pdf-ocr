@@ -1,10 +1,10 @@
 # main.py
-import os, io, re, csv, time, json
+import os, io, re, csv, time, json, unicodedata
 from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
 
@@ -53,7 +53,6 @@ HEADERS = {
 }
 
 PDF_TEMPLATES = [
-    # предпочтение текст-слою
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-ru.pdf",
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start.pdf",
     "https://www.khl.ru/pdf/{season}/{match_id}/game-{match_id}-start-en.pdf",
@@ -82,13 +81,11 @@ def _load_csv_set(path: str) -> set:
                     s.add(name)
     return s
 
-# загрузим один раз (дёшево, не мешает /)
 _dict_players = _load_csv_set(PLAYERS_CSV)
 _dict_refs = _load_csv_set(REFEREES_CSV)
 
-# -------------------- УТИЛЫ ------------------------------
+# -------------------- HTTP ЗАГРУЗКА PDF -------------------
 def http_get(url: str, timeout: float = 25.0) -> Tuple[int, bytes]:
-    # несколько «профилей» заголовков, чтобы пробить антибот
     UA_POOL = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
@@ -102,8 +99,6 @@ def http_get(url: str, timeout: float = 25.0) -> Tuple[int, bytes]:
         "Pragma": "no-cache",
         "Connection": "close",
     }
-
-    # 3 попытки * 3 профиля = до 9 проб
     tries = []
     for ua in UA_POOL:
         hdrs = BASE.copy()
@@ -114,23 +109,22 @@ def http_get(url: str, timeout: float = 25.0) -> Tuple[int, bytes]:
             with httpx.Client(follow_redirects=True, timeout=timeout, headers=hdrs, http2=True) as c:
                 r = c.get(url)
                 tries.append(("httpx", r.status_code))
-                if r.status_code == 200:
+                if r.status_code == 200 and r.content[:4] == b"%PDF":
                     return 200, r.content
-                # небольшой джиттер перед повтором
                 _t.sleep(0.6 + random.random() * 0.6)
         except Exception:
             pass
-        # 2) urllib (жёстко HTTP/1.1)
+        # 2) urllib (HTTP/1.1)
         try:
             from urllib.request import Request, urlopen
             req = Request(url, headers=hdrs)
             with urlopen(req, timeout=timeout) as resp:
                 data = resp.read()
-                return 200, data
+                if data[:4] == b"%PDF":
+                    return 200, data
         except Exception:
             continue
     return 0, b""
-
 
 def fetch_pdf_with_fallback(match_id: int, season: int, pdf_url: Optional[str]) -> Tuple[Optional[bytes], List[str]]:
     tried = []
@@ -147,25 +141,35 @@ def fetch_pdf_with_fallback(match_id: int, season: int, pdf_url: Optional[str]) 
             return data, tried
     return None, tried
 
+# -------------------- ТЕКСТ-НОРМАЛИЗАЦИЯ ------------------
+def _strip_combining(s: str) -> str:
+    # удаляем все комбинирующие символы (в т.ч. ударение U+0301)
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if unicodedata.category(ch) != "Mn")
+
+def clean_text(s: str) -> str:
+    # NBSP/узкие пробелы/неразрывные дефисы -> обычные
+    s = s.replace("\u00A0", " ").replace("\u2009", " ").replace("\u202F", " ").replace("\u2011", "-")
+    s = _strip_combining(s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s
+
 def normalize_tail_y(text: str) -> str:
-    # косметика: СергеИ → Сергей, НиколаИ → Николай, Виталии → Виталий
+    # СергеИ -> Сергей, НиколаИ -> Николай, Виталии -> Виталий
     text = re.sub(r"еи\b", "ей", text, flags=re.IGNORECASE)
     text = re.sub(r"аи\b", "ай", text, flags=re.IGNORECASE)
     text = re.sub(r"ии\b", "ий", text, flags=re.IGNORECASE)
     return text
 
 def dict_fix(name: str, dictset: set) -> str:
-    # если точное совпадение — вернём оригинал из словаря (правильный регистр/буквы)
     if name in dictset:
         return name
-    # поиск по началу и без точек/инициалов
     base = re.sub(r"\.$", "", name).strip()
     for cand in dictset:
         if cand.startswith(base) or base in cand:
             return cand
     return name
 
-# -------- ТЕКСТ-СЛОЙ: половины страницы, координаты -------
+# -------- ТЕКСТ-СЛОЙ: половины страницы -------------------
 def extract_halves_text(pdf_bytes: bytes) -> Tuple[str, str]:
     fitz = _ensure_pymupdf()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -192,7 +196,6 @@ def ocr_first_page(pdf_bytes: bytes, dpi: int = 200, scale: float = 1.25, bin_th
     pytesseract = _ensure_tesseract()
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=1)
     img = preprocess(pages[0])
-    # бинаризация опционально
     if bin_thresh:
         import numpy as np
         arr = np.array(img)
@@ -213,7 +216,6 @@ RE_LINE = re.compile(
 )
 
 def split_blocks(left: str, right: str) -> Dict[str, str]:
-    # грубое деление на блоки
     def grab(block_name: str, text: str) -> str:
         m = re.search(block_name, text, flags=re.IGNORECASE)
         return text[m.start():] if m else ""
@@ -230,7 +232,6 @@ def split_blocks(left: str, right: str) -> Dict[str, str]:
 
 def parse_goalies(block: str, side: str) -> List[Dict[str, str]]:
     res = []
-    # берём 3 строки после слова "Вратари"
     m = re.search(r"Вратари(.+?)(?:Звено|Главный тренер|Линейный|$)", block, flags=re.S)
     if not m:
         return res
@@ -240,7 +241,6 @@ def parse_goalies(block: str, side: str) -> List[Dict[str, str]]:
         if not m2:
             continue
         name = m2.group("name").strip()
-        # вытащим хвост S/R
         gk_flag = ""
         if name.endswith(" С"):
             name = name[:-2].strip(); gk_flag = "S"
@@ -255,7 +255,6 @@ def parse_goalies(block: str, side: str) -> List[Dict[str, str]]:
 def parse_refs(left: str, right: str) -> List[Dict[str, str]]:
     refs = []
     blob = (left + "\n" + right)
-    # главные
     g = re.search(r"Главный судья.+?\n(.+?)\n(.+?)\n", blob, flags=re.S)
     if g:
         a = normalize_tail_y(g.group(1)).strip()
@@ -264,7 +263,6 @@ def parse_refs(left: str, right: str) -> List[Dict[str, str]]:
         b = dict_fix(b, _dict_refs)
         if a: refs.append({"role":"Главный судья","name":a})
         if b: refs.append({"role":"Главный судья","name":b})
-    # линейные
     l = re.search(r"Линейный судья.+?\n(.+?)\n(.+?)\n", blob, flags=re.S)
     if l:
         a = normalize_tail_y(l.group(1)).strip()
@@ -282,7 +280,7 @@ def parse_lineups(left: str, right: str) -> Dict[str, List[Dict[str, Any]]]:
         start = after.end() if after else 0
         for ln in text[start:].splitlines():
             m = RE_LINE.search(ln)
-            if not m: 
+            if not m:
                 continue
             num = m.group("num")
             pos = m.group("pos")
@@ -336,9 +334,10 @@ def ocr_parse(
     if not pdf:
         return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 404, "tried": tried})
     t1 = time.time()
-    # пробуем текст-слой
+    # текст-слой
     try:
         L, R = extract_halves_text(pdf)
+        L = clean_text(L); R = clean_text(R)
         txt = (L + "\n---RIGHT---\n" + R).strip()
         if len(txt) > 100:
             return {
@@ -391,6 +390,7 @@ def extract(
         return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 404, "tried": tried})
     # текст-слой
     L, R = extract_halves_text(pdf)
+    L = clean_text(L); R = clean_text(R)
     blocks = split_blocks(L, R)
     data: Dict[str, Any] = {}
 
