@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.6.0"
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
 
@@ -99,19 +99,17 @@ def http_get(url: str, timeout: float = 25.0) -> Tuple[int, bytes]:
         "Pragma": "no-cache",
         "Connection": "close",
     }
-    tries = []
     for ua in UA_POOL:
-        hdrs = BASE.copy()
+        hdrs = dict(BASE)
         hdrs["User-Agent"] = ua
         # 1) httpx (HTTP/2)
         try:
             import httpx, random, time as _t
             with httpx.Client(follow_redirects=True, timeout=timeout, headers=hdrs, http2=True) as c:
                 r = c.get(url)
-                tries.append(("httpx", r.status_code))
                 if r.status_code == 200 and r.content[:4] == b"%PDF":
                     return 200, r.content
-                _t.sleep(0.6 + random.random() * 0.6)
+                _t.sleep(0.5 + random.random() * 0.5)
         except Exception:
             pass
         # 2) urllib (HTTP/1.1)
@@ -161,25 +159,58 @@ def normalize_tail_y(text: str) -> str:
     return text
 
 def dict_fix(name: str, dictset: set) -> str:
+    if not name:
+        return name
     if name in dictset:
         return name
     base = re.sub(r"\.$", "", name).strip()
+    # грубый, но полезный автофикс: берём ближайший словарный по префиксу
     for cand in dictset:
         if cand.startswith(base) or base in cand:
             return cand
     return name
 
-# -------- ТЕКСТ-СЛОЙ: половины страницы -------------------
+# -------------------- СБОРКА ТЕКСТА ИЗ WORDS ----------------
+def words_to_text(page, clip) -> str:
+    """Стабильно собирает текст в пределах clip по строкам."""
+    words = page.get_text("words", clip=clip)  # [x0,y0,x1,y1, "word", block_no, line_no, word_no]
+    # сортируем: сначала по y (строка), потом по x (порядок слов)
+    words.sort(key=lambda w: (round(w[1], 1), w[0]))
+    lines: List[List[str]] = []
+    current_y = None
+    buf: List[str] = []
+    for w in words:
+        y0 = round(w[1], 1)
+        txt = w[4]
+        if current_y is None:
+            current_y = y0
+            buf = [txt]
+            continue
+        # новый визуальный ряд, если вертикальный сдвиг заметный
+        if abs(y0 - current_y) > 2.0:
+            lines.append(buf)
+            buf = [txt]
+            current_y = y0
+        else:
+            buf.append(txt)
+    if buf:
+        lines.append(buf)
+    # склеиваем слова пробелами, потом строки переводами
+    out = "\n".join(" ".join(items) for items in lines)
+    return out
+
 def extract_halves_text(pdf_bytes: bytes) -> Tuple[str, str]:
+    """Читает страницу как две независимые колонки по words -> строки."""
     fitz = _ensure_pymupdf()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
     rect = page.rect
-    mid_x = rect.width / 2
-    left = fitz.Rect(rect.x0, rect.y0, mid_x, rect.y1)
-    right = fitz.Rect(mid_x, rect.y0, rect.x1, rect.y1)
-    tl = page.get_text("text", clip=left) or ""
-    tr = page.get_text("text", clip=right) or ""
+    mid_x = rect.width / 2.0
+    # Иногда буквы подрезаются на самом краю — добавим по 2pt «воздуха»
+    left = fitz.Rect(rect.x0 - 2, rect.y0, mid_x + 2, rect.y1)
+    right = fitz.Rect(mid_x - 2, rect.y0, rect.x1 + 2, rect.y1)
+    tl = words_to_text(page, left)
+    tr = words_to_text(page, right)
     doc.close()
     return tl, tr
 
@@ -202,10 +233,14 @@ def ocr_first_page(pdf_bytes: bytes, dpi: int = 200, scale: float = 1.25, bin_th
         arr = (arr > bin_thresh) * 255
         from PIL import Image as _Image
         img = _Image.fromarray(arr.astype("uint8"))
-    txt = pytesseract.image_to_string(img, lang="rus+eng", config="--oem 1 --psm 6 --dpi 300 --tessedit_preserve_interword_spaces=1")
+    txt = pytesseract.image_to_string(img, lang="rus+eng",
+                                      config="--oem 1 --psm 6 --dpi 300 --tessedit_preserve_interword_spaces=1")
     return txt
 
 # -------- ПАРСИНГ БЛОКОВ ----------------------------------
+# заголовок таблицы бывает разный: «Фамилия Имя», «Фамилия, Имя», со звёздочкой и т.п.
+HEADER_RE = re.compile(r"№\s+Поз\s+Фамилия,?\s*Имя(?:\s*\*)?\s+Д\.Р\.\s+Лет", re.I)
+
 RE_LINE = re.compile(
     r"^\s*(?P<num>\d{1,2})\s+"
     r"(?P<pos>[ВЗН])\s+"
@@ -217,22 +252,20 @@ RE_LINE = re.compile(
 
 def split_blocks(left: str, right: str) -> Dict[str, str]:
     def grab(block_name: str, text: str) -> str:
-        m = re.search(block_name, text, flags=re.IGNORECASE)
+        m = re.search(block_name, text, flags=re.I)
         return text[m.start():] if m else ""
     return {
         "left": left,
         "right": right,
         "goalies_l": grab(r"Вратари", left),
         "goalies_r": grab(r"Вратари", right),
-        "refs_l": grab(r"Главный судья", left),
-        "refs_r": grab(r"Главный судья", right),
         "lineups_l": left,
         "lineups_r": right,
     }
 
 def parse_goalies(block: str, side: str) -> List[Dict[str, str]]:
     res = []
-    m = re.search(r"Вратари(.+?)(?:Звено|Главный тренер|Линейный|$)", block, flags=re.S)
+    m = re.search(r"Вратари(.+?)(?:Звено|Главный тренер|Линейный|№\s+Поз|$)", block, flags=re.S | re.I)
     if not m:
         return res
     lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
@@ -253,54 +286,61 @@ def parse_goalies(block: str, side: str) -> List[Dict[str, str]]:
     return res
 
 def parse_refs(left: str, right: str) -> List[Dict[str, str]]:
-    refs = []
-    blob = (left + "\n" + right)
-    g = re.search(r"Главный судья.+?\n(.+?)\n(.+?)\n", blob, flags=re.S)
+    blob = left + "\n" + right
+    refs: List[Dict[str, str]] = []
+
+    # Главные судьи (две строки подряд после заголовка)
+    g = re.search(r"Главный\s+судья.*?\n(.+?)\n(.+?)\n", blob, flags=re.S | re.I)
     if g:
         a = normalize_tail_y(g.group(1)).strip()
         b = normalize_tail_y(g.group(2)).strip()
         a = dict_fix(a, _dict_refs)
         b = dict_fix(b, _dict_refs)
-        if a: refs.append({"role":"Главный судья","name":a})
-        if b: refs.append({"role":"Главный судья","name":b})
-    l = re.search(r"Линейный судья.+?\n(.+?)\n(.+?)\n", blob, flags=re.S)
+        if a: refs.append({"role": "Главный судья", "name": a})
+        if b: refs.append({"role": "Главный судья", "name": b})
+
+    # Линейные (две строки подряд)
+    l = re.search(r"Линейный\s+судья.*?\n(.+?)\n(.+?)\n", blob, flags=re.S | re.I)
     if l:
         a = normalize_tail_y(l.group(1)).strip()
         b = normalize_tail_y(l.group(2)).strip()
         a = dict_fix(a, _dict_refs)
         b = dict_fix(b, _dict_refs)
-        if a: refs.append({"role":"Линейный судья","name":a})
-        if b: refs.append({"role":"Линейный судья","name":b})
+        if a: refs.append({"role": "Линейный судья", "name": a})
+        if b: refs.append({"role": "Линейный судья", "name": b})
+
     return refs
 
+def parse_lineups_block(text: str, side: str) -> List[Dict[str, Any]]:
+    sink: List[Dict[str, Any]] = []
+    m = HEADER_RE.search(text)
+    start = m.end() if m else 0
+    for ln in text[start:].splitlines():
+        m2 = RE_LINE.search(ln)
+        if not m2:
+            continue
+        num = m2.group("num")
+        pos = m2.group("pos")
+        name = m2.group("name").strip()
+        capt = (m2.group("capt") or "").strip()
+        dob  = m2.group("dob")
+        age  = m2.group("age")
+        gk_flag, gk_status = "", None
+        if pos == "В":
+            if name.endswith(" С"): name, gk_flag, gk_status = name[:-2].strip(), "S", "starter"
+            elif name.endswith(" Р"): name, gk_flag, gk_status = name[:-2].strip(), "R", "reserve"
+        name = normalize_tail_y(name)
+        name = dict_fix(name, _dict_players)
+        sink.append({
+            "side": side, "num": num, "pos": pos, "name": name,
+            "capt": capt, "dob": dob, "age": age,
+            "gk_flag": gk_flag, "gk_status": gk_status
+        })
+    return sink
+
 def parse_lineups(left: str, right: str) -> Dict[str, List[Dict[str, Any]]]:
-    out_home, out_away = [], []
-    def collect(text: str, side: str, sink: List[Dict[str, Any]]):
-        after = re.search(r"№\s+Поз\s+Фамилия,?\s*Имя.*?\n", text)
-        start = after.end() if after else 0
-        for ln in text[start:].splitlines():
-            m = RE_LINE.search(ln)
-            if not m:
-                continue
-            num = m.group("num")
-            pos = m.group("pos")
-            name = m.group("name").strip()
-            capt = (m.group("capt") or "").strip()
-            dob  = m.group("dob")
-            age  = m.group("age")
-            gk_flag, gk_status = "", None
-            if pos == "В":
-                if name.endswith(" С"): name, gk_flag, gk_status = name[:-2].strip(), "S", "starter"
-                elif name.endswith(" Р"): name, gk_flag, gk_status = name[:-2].strip(), "R", "reserve"
-            name = normalize_tail_y(name)
-            name = dict_fix(name, _dict_players)
-            sink.append({
-                "side": side, "num": num, "pos": pos, "name": name,
-                "capt": capt, "dob": dob, "age": age,
-                "gk_flag": gk_flag, "gk_status": gk_status
-            })
-    collect(left,  "home", out_home)
-    collect(right, "away", out_away)
+    out_home = parse_lineups_block(left,  "home")
+    out_away = parse_lineups_block(right, "away")
     return {"home": out_home, "away": out_away}
 
 # -------------------- ENDPOINTS ---------------------------
@@ -334,7 +374,7 @@ def ocr_parse(
     if not pdf:
         return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 404, "tried": tried})
     t1 = time.time()
-    # текст-слой
+    # Текст-слой
     try:
         L, R = extract_halves_text(pdf)
         L = clean_text(L); R = clean_text(R)
@@ -388,18 +428,25 @@ def extract(
     pdf, tried = fetch_pdf_with_fallback(match_id, season, pdf_url)
     if not pdf:
         return JSONResponse({"ok": False, "match_id": match_id, "season": season, "step": "GET", "status": 404, "tried": tried})
-    # текст-слой
+
+    # Текст-слой с устойчивой сборкой по колонкам
     L, R = extract_halves_text(pdf)
     L = clean_text(L); R = clean_text(R)
-    blocks = split_blocks(L, R)
-    data: Dict[str, Any] = {}
 
+    data: Dict[str, Any] = {}
+    # refs всегда можно парсить из колонок
     if target in ("refs", "all"):
-        data["refs"] = parse_refs(blocks["left"], blocks["right"])
+        data["refs"] = parse_refs(L, R)
+
+    # goalies / lineups
+    if target in ("goalies", "all", "lineups"):
+        blocks = split_blocks(L, R)
+
     if target in ("goalies", "all"):
         home_g = parse_goalies(blocks["goalies_l"], "home")
         away_g = parse_goalies(blocks["goalies_r"], "away")
         data["goalies"] = {"home": home_g, "away": away_g}
+
     if target in ("lineups", "all"):
         data["lineups"] = parse_lineups(blocks["lineups_l"], blocks["lineups_r"])
 
