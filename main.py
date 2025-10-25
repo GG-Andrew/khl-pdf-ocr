@@ -1,13 +1,13 @@
 # main.py
-# KHL PDF OCR Server — v1.2.1 (robust errors)
+# KHL PDF OCR Server — v1.3.0 (fast halves + cache)
 # - /          : health
-# - /ocr       : OCR PDF с авто-фолбэком URL, прогревом cookies, «браузерными» заголовками
+# - /ocr       : быстрый OCR (split на 2 колонки, dpi=150/scale=1.15), кэш 15 минут
 # - /extract   : черновая структура (refs[], goalies{home,away}, lineups_raw)
-# При любой ошибке возвращаем JSON {"ok": false, "step": "...","error":"..."} вместо 500.
+# Все ошибки -> JSON {"ok": false, "step": "...","error":"..."}.
 
-import re
-import time
+import re, time, hashlib
 from typing import List, Dict, Optional, Tuple
+from collections import OrderedDict
 
 import httpx
 from fastapi import FastAPI, Query
@@ -16,7 +16,7 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 DEFAULT_SEASON = 1369
 
 app = FastAPI(title="KHL PDF OCR Server", version=APP_VERSION)
@@ -47,6 +47,39 @@ PDF_TEMPLATES = [
     "https://www.khl.ru/documents/{season}/{match_id}.pdf",
 ]
 
+# ---------------------------- LRU-кэш OCR (на 15 минут) ----------------------------
+
+class TTLCache(OrderedDict):
+    def __init__(self, maxsize=64, ttl=900):
+        super().__init__()
+        self.maxsize = maxsize
+        self.ttl = ttl  # seconds
+
+    def _now(self): return time.time()
+
+    def get_cached(self, key):
+        item = super().get(key)
+        if not item: return None
+        ts, val = item
+        if self._now() - ts > self.ttl:
+            try: del self[key]
+            except KeyError: pass
+            return None
+        self.move_to_end(key)
+        return val
+
+    def set_cached(self, key, val):
+        super().__setitem__(key, (self._now(), val))
+        self.move_to_end(key)
+        if len(self) > self.maxsize:
+            self.popitem(last=False)
+
+OCR_CACHE = TTLCache(maxsize=64, ttl=900)
+
+def cache_key_pdf(pdf_bytes: bytes, dpi: int, max_pages: int, scale: float, bin_thresh: int) -> str:
+    h = hashlib.sha256(pdf_bytes).hexdigest()[:16]
+    return f"{h}:{dpi}:{max_pages}:{scale}:{bin_thresh}"
+
 # ---------------------------- Нормализация текста ----------------------------
 
 LAT_TO_CYR = str.maketrans({
@@ -66,20 +99,21 @@ COMMON_FIXES = [
 ]
 
 def normalize_cyrillic(text: str) -> str:
-    if not text:
-        return text
+    if not text: return text
     s = text.translate(LAT_TO_CYR)
-    s = re.sub(r"([А-ЯЁ][а-яё]{2,})([А-ЯЁ][а-яё]{2,})", r"\1 \2", s)  # "БелоусовГеоргий" -> "Белоусов Георгий"
-    s = re.sub(r"([А-ЯЁ][а-яё]+)([А-ЯЁ]\.)", r"\1 \2", s)              # "ФамилияИ." -> "Фамилия И."
+    # "БелоусовГеоргий" -> "Белоусов Георгий" (избегаем «СоставыКоманд» и т.п.)
+    s = re.sub(r"(?<![А-ЯЁа-яё])([А-ЯЁ][а-яё]{2,})([А-ЯЁ][а-яё]{2,})", r"\1 \2", s)
+    # "ФамилияИ." -> "Фамилия И."
+    s = re.sub(r"([А-ЯЁ][а-яё]+)([А-ЯЁ]\.)", r"\1 \2", s)
     for pat, repl in COMMON_FIXES:
         s = re.sub(pat, repl, s)
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-# ---------------------------- OCR-препроцесс / OCR ----------------------------
+# ---------------------------- OCR-препроцесс / OCR (быстро) ----------------------------
 
-def preprocess(img, scale: float = 1.25, bin_thresh: int = 185):
+def preprocess(img, scale: float = 1.15, bin_thresh: int = 185):
     w, h = img.size
     img = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
     img = ImageOps.autocontrast(img)
@@ -88,12 +122,42 @@ def preprocess(img, scale: float = 1.25, bin_thresh: int = 185):
     img = img.filter(ImageFilter.SHARPEN)
     return img
 
-def ocr_images(images: List, lang: str = "rus+eng") -> str:
+def ocr_one(im, lang="rus+eng"):
     cfg = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
-    blocks = []
-    for im in images:
-        blocks.append(pytesseract.image_to_string(im, lang=lang, config=cfg))
-    return "\n".join(blocks)
+    return pytesseract.image_to_string(im, lang=lang, config=cfg)
+
+def ocr_fast_halves(page_img) -> str:
+    """Режем страницу пополам (левая/правая колонка) и OCR'им их отдельно — быстрее и чище."""
+    w, h = page_img.size
+    mid = w // 2
+    left = page_img.crop((0, 0, mid, h))
+    right = page_img.crop((mid, 0, w, h))
+    return ocr_one(left) + "\n" + ocr_one(right)
+
+def run_ocr_pipeline(pdf_bytes: bytes, dpi: int, max_pages: int, scale: float, bin_thresh: int) -> Tuple[str, int, Dict[str,float]]:
+    key = cache_key_pdf(pdf_bytes, dpi, max_pages, scale, bin_thresh)
+    cached = OCR_CACHE.get_cached(key)
+    if cached: 
+        return cached["text"], cached["pages"], cached["metrics"]
+
+    t0 = time.time()
+    pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
+    t_pdf = time.time()
+
+    out_blocks = []
+    for p in pages:
+        pp = preprocess(p, scale=scale, bin_thresh=bin_thresh)
+        out_blocks.append(ocr_fast_halves(pp))
+    t_ocr = time.time()
+
+    text = normalize_cyrillic("\n".join(out_blocks))
+    metrics = {
+        "dur_raster_s": round(t_pdf - t0, 3),
+        "dur_ocr_s": round(t_ocr - t_pdf, 3),
+        "dur_total_s": round(t_ocr - t0, 3),
+    }
+    OCR_CACHE.set_cached(key, {"text": text, "pages": len(pages), "metrics": metrics})
+    return text, len(pages), metrics
 
 # ---------------------------- Скачивание PDF (с прогревом) ----------------------------
 
@@ -105,12 +169,7 @@ async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> T
 
     last_error: Optional[str] = None
     timeout = httpx.Timeout(25.0)
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=timeout,
-        headers=HEADERS
-    ) as client:
-        # прогрев куков
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=HEADERS) as client:
         try:
             await client.get("https://www.khl.ru/", headers=HEADERS)
             await client.get(f"https://www.khl.ru/game/{match_id}/", headers=HEADERS)
@@ -126,21 +185,17 @@ async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> T
             local_headers["Referer"] = f"https://www.khl.ru/game/{match_id}/"
             try:
                 r = await client.get(url, headers=local_headers)
-                if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
+                if r.status_code == 200 and r.headers.get("content-type","").startswith("application/pdf"):
                     return r.content, url, tried, None
                 else:
                     last_error = f"status:{r.status_code} ct:{r.headers.get('content-type','')}"
             except Exception as e:
                 last_error = f"get:{type(e).__name__}:{e}"
 
-        # облегчённые заголовки
         for url in list(tried):
             try:
-                r = await client.get(url, headers={
-                    "User-Agent": HEADERS["User-Agent"],
-                    "Referer": f"https://www.khl.ru/game/{match_id}/"
-                })
-                if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
+                r = await client.get(url, headers={"User-Agent": HEADERS["User-Agent"], "Referer": f"https://www.khl.ru/game/{match_id}/"})
+                if r.status_code == 200 and r.headers.get("content-type","").startswith("application/pdf"):
                     return r.content, url, tried, None
                 else:
                     last_error = f"fallback_status:{r.status_code}"
@@ -149,7 +204,7 @@ async def fetch_pdf_with_fallback(pdf_url: str, match_id: int, season: int) -> T
 
     return None, None, tried, last_error
 
-# ---------------------------- Вспомогательные парсеры ----------------------------
+# ---------------------------- Парсеры блоков ----------------------------
 
 SECTION_PATTERNS = {
     "goalies": r"(?:\bВратари\b[\s\S]{0,900})",
@@ -163,8 +218,7 @@ def extract_block(text: str, key: str) -> str:
 
 def parse_referees(block: str) -> List[Dict[str, str]]:
     out = []
-    if not block:
-        return out
+    if not block: return out
     lines = [l.strip() for l in block.split("\n") if l.strip()]
     role_map = []
     for ln in lines:
@@ -176,42 +230,32 @@ def parse_referees(block: str) -> List[Dict[str, str]]:
             elif re.search(r"[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+", ln):
                 out.append({"role": "Судья", "name": ln})
     for r in role_map:
-        if r["name"]:
-            out.append(r)
+        if r["name"]: out.append(r)
     seen, uniq = set(), []
     for j in out:
         k = (j["role"], j["name"])
-        if k in seen: 
-            continue
-        seen.add(k)
-        uniq.append(j)
+        if k in seen: continue
+        seen.add(k); uniq.append(j)
     return uniq
 
 def parse_goalies(block: str) -> Dict[str, List[Dict[str, str]]]:
     res = {"home": [], "away": []}
-    if not block:
-        return res
+    if not block: return res
     parts = re.split(r"\bВратари\b", block, flags=re.I)
     cols = [p.strip() for p in parts[1:3] if p.strip()]
     fio_re = re.compile(r"\b[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ]\.)?\b")
     for idx, col in enumerate(cols):
         side = "home" if idx == 0 else "away"
         buf = " ".join(col.splitlines())
-        found = []
+        found, seen = [], set()
         for m in fio_re.finditer(buf):
             nm = m.group(0).strip()
-            if len(nm) >= 5:
-                found.append({"name": nm})
-        seen, uniq = set(), []
-        for f in found:
-            if f["name"] in seen:
-                continue
-            seen.add(f["name"])
-            uniq.append(f)
-        res[side] = uniq[:3]
+            if len(nm) >= 5 and nm not in seen:
+                seen.add(nm); found.append({"name": nm})
+        res[side] = found[:3]
     return res
 
-# ---------------------------- Модели ответов ----------------------------
+# ---------------------------- Модели ответа ----------------------------
 
 class OCRResponse(BaseModel):
     ok: bool
@@ -240,13 +284,13 @@ def root():
 
 @app.get("/ocr", response_model=OCRResponse)
 async def ocr_parse(
-    match_id: int = Query(..., description="UID матча КХЛ"),
-    pdf_url: str = Query(..., description="URL на PDF протокола"),
+    match_id: int = Query(...),
+    pdf_url: str = Query(...),
     season: int = Query(DEFAULT_SEASON),
-    dpi: int = Query(200, ge=120, le=360, description="DPI растрирования PDF"),
-    max_pages: int = Query(1, ge=1, le=3, description="Сколько первых страниц OCR’ить"),
-    scale: float = Query(1.25, ge=1.0, le=2.0, description="Апскейл картинки перед OCR"),
-    bin_thresh: int = Query(185, ge=120, le=230, description="Порог бинаризации 0-255"),
+    dpi: int = Query(150, ge=120, le=360),
+    max_pages: int = Query(1, ge=1, le=3),
+    scale: float = Query(1.15, ge=1.0, le=2.0),
+    bin_thresh: int = Query(185, ge=120, le=230),
 ):
     t0 = time.time()
     try:
@@ -255,29 +299,20 @@ async def ocr_parse(
             return OCRResponse(ok=False, step="GET", status=404, match_id=match_id, season=season, tried=tried, error=last_err)
 
         t_pdf = time.time()
-        pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
-        proc = [preprocess(p, scale=scale, bin_thresh=bin_thresh) for p in pages]
-        t_pre = time.time()
-
-        raw_text = ocr_images(proc, lang="rus+eng")
-        text = normalize_cyrillic(raw_text)
-        t_ocr = time.time()
+        text, pages_cnt, metrics = run_ocr_pipeline(pdf_bytes, dpi, max_pages, scale, bin_thresh)
+        t_done = time.time()
 
         snippet = re.sub(r"\s+", " ", text.strip())[:480]
         return OCRResponse(
             ok=True,
-            match_id=match_id,
-            season=season,
-            source_pdf=final_url,
-            pdf_len=len(pdf_bytes),
-            dpi=dpi,
-            pages_ocr=len(proc),
-            dur_total_s=round(t_ocr - t0, 3),
+            match_id=match_id, season=season,
+            source_pdf=final_url, pdf_len=len(pdf_bytes),
+            dpi=dpi, pages_ocr=pages_cnt,
+            dur_total_s=round(t_done - t0, 3),
             dur_download_s=round(t_pdf - t0, 3),
-            dur_preproc_s=round(t_pre - t_pdf, 3),
-            dur_ocr_s=round(t_ocr - t_pre, 3),
-            text_len=len(text),
-            snippet=snippet,
+            dur_preproc_s=metrics["dur_raster_s"],
+            dur_ocr_s=metrics["dur_ocr_s"],
+            text_len=len(text), snippet=snippet
         )
     except Exception as e:
         return OCRResponse(ok=False, step="OCR", status=500, match_id=match_id, season=season, error=f"{type(e).__name__}: {e}")
@@ -287,9 +322,9 @@ async def extract_structured(
     match_id: int = Query(...),
     pdf_url: str = Query(...),
     season: int = Query(DEFAULT_SEASON),
-    dpi: int = Query(200, ge=120, le=360),
+    dpi: int = Query(150, ge=120, le=360),
     max_pages: int = Query(1, ge=1, le=3),
-    scale: float = Query(1.25, ge=1.0, le=2.0),
+    scale: float = Query(1.15, ge=1.0, le=2.0),
     bin_thresh: int = Query(185, ge=120, le=230),
     target: str = Query("all", description="refs|goalies|lineups|all"),
 ):
@@ -299,10 +334,7 @@ async def extract_structured(
         if not pdf_bytes:
             return {"ok": False, "step": "GET", "status": 404, "match_id": match_id, "season": season, "tried": tried, "error": last_err}
 
-        pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
-        proc = [preprocess(p, scale=scale, bin_thresh=bin_thresh) for p in pages]
-        raw_text = ocr_images(proc, lang="rus+eng")
-        text = normalize_cyrillic(raw_text)
+        text, pages_cnt, metrics = run_ocr_pipeline(pdf_bytes, dpi, max_pages, scale, bin_thresh)
 
         keys = ["refs", "goalies", "lineups"] if target == "all" else [target]
         data: Dict[str, object] = {}
@@ -317,12 +349,13 @@ async def extract_structured(
 
         return {
             "ok": True,
-            "match_id": match_id,
-            "season": season,
-            "source_pdf": final_url,
-            "dpi": dpi,
-            "pages_ocr": len(proc),
+            "match_id": match_id, "season": season,
+            "source_pdf": final_url, "pdf_len": len(pdf_bytes),
+            "dpi": dpi, "pages_ocr": pages_cnt,
             "dur_total_s": round(time.time() - t0, 3),
+            "dur_download_s": 0.0,  # уже учтено в кэше/растре
+            "dur_preproc_s": metrics["dur_raster_s"],
+            "dur_ocr_s": metrics["dur_ocr_s"],
             "text_len": len(text),
             "data": data,
         }
