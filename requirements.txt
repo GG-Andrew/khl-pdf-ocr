@@ -8,3 +8,7 @@ regex==2024.9.11
 unicodedata2==23.3.0
 pydantic==2.9.2
 statistics==1.0.3.5
+httpx==0.27.2
+pillow==10.4.0
+pdfminer.six==20231228
+rapidfuzz==3.9.6
