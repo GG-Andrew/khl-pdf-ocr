@@ -1,280 +1,240 @@
-# app.py — KHL PDF OCR/WORDS API (Render)
-# эндпоинты:
-#  GET /health
-#  GET /ocr?url=<pdf-url> | /ocr?season=1369&uid=897689
-#  GET /extract?season=1369&uid=897689&mode=words|ocr&dpi=300
+import io, os, re, time
+from typing import Any, Dict, List
 
-import os
-import io
-import re
-import time
-from typing import Dict, Any, List, Tuple, Optional
-
-from flask import Flask, request, jsonify, Response
-
-import requests
+from flask import Flask, request, jsonify
 import cloudscraper
-
-# pdf → text (вариант 1: words)
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextBoxHorizontal, LTChar, LTAnno, LTTextLine
-
-# pdf → OCR (вариант 2: ocr)
-import pytesseract
+import fitz  # PyMuPDF
 from PIL import Image
-from pdf2image import convert_from_bytes
+import pytesseract
 
 app = Flask(__name__)
 
-# -----------------------------
-# 1) Грузим PDF с khl.ru с обходом 403
-# -----------------------------
-def fetch_pdf_bytes(season: str, uid: str) -> bytes:
-    """
-    Тянем PDF с khl.ru, обходя 403 через Cloudflare:
-    1) cloudscraper с хромовскими заголовками
-    2) fallback на requests
-    3) поддержка PROXY_URL (если нужно)
-    """
-    uid = str(uid).strip()
-    season = str(season).strip()
-
-    urls = [
-        f"https://www.khl.ru/pdf/{season}/{uid}/game-{uid}-start-ru.pdf",
-        f"https://khl.ru/pdf/{season}/{uid}/game-{uid}-start-ru.pdf",
-    ]
-    referer = f"https://www.khl.ru/game/{season}/{uid}/preview/"
-
+# ---------------- HTTP загрузка PDF (обход 403 khl.ru) ----------------
+def fetch_pdf_bytes(season: str, uid: str, timeout: int = 20) -> bytes:
+    pdf_url = f"https://www.khl.ru/pdf/{season}/{uid}/game-{uid}-start-ru.pdf"
+    preview = f"https://www.khl.ru/game/{season}/{uid}/preview/"
+    s = cloudscraper.create_scraper(browser={"browser": "firefox", "platform": "windows"})
     headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0.0.0 Safari/537.36"),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": referer,
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) "
+                       "Gecko/20100101 Firefox/132.0"),
+        "Accept": "application/pdf,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.9",
+        "Referer": preview,
+        "Origin": "https://www.khl.ru",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
-
-    proxy_url = os.getenv("PROXY_URL", "").strip()
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-
-    # 1) cloudscraper
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    for u in urls:
+    last = None
+    for i in range(3):
         try:
-            r = scraper.get(u, headers=headers, timeout=25, proxies=proxies)
-            if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
+            s.head(pdf_url, headers=headers, timeout=timeout, allow_redirects=True)
+            r = s.get(pdf_url, headers=headers, timeout=timeout, allow_redirects=True)
+            last = r
+            if r.status_code == 200 and r.content and r.headers.get("Content-Type","").startswith("application/pdf"):
                 return r.content
-            if r.status_code in (403, 409, 429, 503):
-                time.sleep(1.5)
-                r = scraper.get(u, headers=headers, timeout=25, proxies=proxies)
-                if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
-                    return r.content
+            if r.status_code == 403:
+                headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                         "Chrome/119.0.0.0 Safari/537.36")
+                time.sleep(0.7)
         except Exception:
-            pass  # пойдём на fallback
+            time.sleep(0.5)
+    raise RuntimeError(f"http {getattr(last,'status_code', 'error')}")
 
-    # 2) fallback: requests
-    for u in urls:
-        try:
-            r = requests.get(u, headers=headers, timeout=25, proxies=proxies)
-            if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
-                return r.content
-        except Exception:
-            continue
-
-    raise RuntimeError("http 403: khl.ru заблокировал загрузку PDF (после всех попыток)")
-
-# -----------------------------
-# 2) WORDS: аккуратное чтение текстового слоя
-# -----------------------------
-def page_words(pdf_bytes: bytes) -> List[str]:
-    out: List[str] = []
-    for page_layout in extract_pages(io.BytesIO(pdf_bytes)):
-        lines: List[str] = []
-        for element in page_layout:
-            if isinstance(element, LTTextBoxHorizontal):
-                for obj in element:
-                    if isinstance(obj, LTTextLine):
-                        text = obj.get_text()
-                        text = text.replace("\xa0", " ").strip()
-                        if text:
-                            lines.append(text)
-        out.extend(lines)
+# ---------------- Базовые извлекатели ----------------
+def extract_words(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for pno in range(len(doc)):
+        page = doc[pno]
+        words = page.get_text("words")
+        words.sort(key=lambda w: (w[1], w[0]))
+        for (x0, y0, x1, y1, w, b, l, n) in words:
+            out.append({"page": pno+1, "x0": round(x0,2), "y0": round(y0,2),
+                        "x1": round(x1,2), "y1": round(y1,2),
+                        "w": w, "block": b, "line": l, "idx": n})
     return out
 
-# -----------------------------
-# 3) OCR (как fallback)
-# -----------------------------
-def ocr_text(pdf_bytes: bytes, dpi: int = 300) -> str:
-    images = convert_from_bytes(pdf_bytes, dpi=dpi)
-    chunks: List[str] = []
-    for img in images[:2]:  # достаточно первых 2 страниц
-        txt = pytesseract.image_to_string(img, lang="rus+eng", config="--psm 6")
-        chunks.append(txt)
-    return "\n".join(chunks)
+def extract_text(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    return "\n".join(p.get_text() for p in doc)
 
-# -----------------------------
-# 4) Черновой парсинг из words/ocr в структуру (минимум — чтобы ты мог видеть прогресс)
-#    Это базовый каркас. Тонкую логику можно донастроить после.
-# -----------------------------
-POS_MAP = {"З": "D", "Н": "F", "В": "G"}
-SECT_TITLES = ("Звено 1", "Звено 2", "Звено 3", "Звено 4")
+# ---------------- Вырезка области + OCR судей ----------------
+REF_ROLE_RX = re.compile(r"\b(Главн\w*\s+судья|Линейн\w*\s+судья|Резервн\w+)\b", re.I)
+NAME_CLEAN_RX = re.compile(r"\b(Главн\w*|Линейн\w*|Резервн\w*|судья|судьи|Обновлено.*)\b", re.I)
+MULTI_SPACE = re.compile(r"\s{2,}")
 
-def rough_extract_struct(lines: List[str]) -> Dict[str, Any]:
-    data = {
-        "home": {"team": "", "goalies": [], "lines": {"1": [], "2": [], "3": [], "4": []}, "bench": []},
-        "away": {"team": "", "goalies": [], "lines": {"1": [], "2": [], "3": [], "4": []}, "bench": []},
-    }
-    refs = {"main": [], "linesmen": []}
+def page_image(pdf_bytes: bytes, page_index: int, zoom: float = 2.0) -> Image.Image:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_index]
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-    # очень простой хук: выдёргиваем судей из большого блока внизу
-    joined = " ".join(lines)
-    m = re.search(r"(Главн\w+\s+суд[ьяи].+)$", joined, flags=re.I)
-    if m:
-        block = m.group(1)
-        # главные
-        mains = re.findall(r"(?:Главн\w+\s+суд[ьяи])\s*[:\-]?\s*([А-ЯЁA-Z][^,;]+)", block, flags=re.I)
-        for x in mains:
-            name = re.sub(r"\s{2,}", " ", x).strip().strip(" .,:;")
-            if name:
-                refs["main"].append(name)
-        # линейные
-        linesm = re.findall(r"(?:Линейн\w+\s+суд[ьяи])\s*[:\-]?\s*([А-ЯЁA-Z][^,;]+)", block, flags=re.I)
-        for x in linesm:
-            name = re.sub(r"\s{2,}", " ", x).strip().strip(" .,:;")
-            if name:
-                refs["linesmen"].append(name)
+def ocr_referees(pdf_bytes: bytes) -> Dict[str, List[str]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    last_idx = len(doc) - 1
+    page = doc[last_idx]
+    # пробуем сначала найти прямоугольник блока судей по словам "судья"
+    words = page.get_text("words")
+    cand = [w for w in words if REF_ROLE_RX.search(w[4] or "")]
+    if cand:
+        y0 = min(w[1] for w in cand) - 40
+        y1 = max(w[3] for w in cand) + 40
+        y0 = max(y0, 0); y1 = min(y1, page.rect.height)
+        rect = fitz.Rect(0, y0, page.rect.width, y1)
+    else:
+        # эвристика: нижняя четверть страницы
+        h = page.rect.height
+        rect = fitz.Rect(0, h*0.72, page.rect.width, h)
 
-    # команды
-    for s in lines[:15]:
-        if "НЕФТЕХИМИК" in s.upper():
-            data["home"]["team"] = "НЕФТЕХИМИК НИЖНЕКАМСК"
-        if "САЛАВАТ ЮЛАЕВ" in s.upper():
-            data["away"]["team"] = "САЛАВАТ ЮЛАЕВ УФА"
+    # рендерим только выбранную область
+    mat = fitz.Matrix(3.0, 3.0)  # ~300dpi
+    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-    # вратари — ищем блок сверху (3 строки, где "В " и номер)
-    for s in lines[:30]:
-        ms = re.match(r"^\s*(\d{1,2})\s+В\s+([А-ЯЁа-яёA-Za-z\.\- ]+)", s)
-        if ms:
-            num = ms.group(1)
-            name = ms.group(2).strip()
-            if "Самонов" in name or "Вязов" in name or "Мозгов" in name:
-                data["away"]["goalies"].append({"number": num, "name": name, "gk_status": ""})
-            else:
-                data["home"]["goalies"].append({"number": num, "name": name, "gk_status": ""})
+    ocr_text = pytesseract.image_to_string(img, lang="rus+eng", config="--oem 1 --psm 6")
+    lines = [l.strip() for l in ocr_text.splitlines() if l.strip()]
 
-    # звенья — черновик
-    cur = "home"
-    cur_line = "1"
-    for s in lines:
-        if "Звено 1" in s: cur_line = "1"; continue
-        if "Звено 2" in s: cur_line = "2"; continue
-        if "Звено 3" in s: cur_line = "3"; continue
-        if "Звено 4" in s: cur_line = "4"; continue
-        # переключение на away примерно по середине листа
-        if "Главный тренер" in s and cur == "home":
-            cur = "away"
-            cur_line = "1"
+    # собираем роли -> имена
+    main, linesmen = [], []
+    current_role = None
+    for raw in lines:
+        low = raw.lower()
+        if "главн" in low and "суд" in low:
+            current_role = "main"
             continue
+        if "линей" in low and "суд" in low:
+            current_role = "linesmen"
+            continue
+        # чистим хвосты "Резервный ..."
+        clean = NAME_CLEAN_RX.sub(" ", raw)
+        clean = MULTI_SPACE.sub(" ", clean).strip(" ,.;:—-")
+        if not clean:
+            continue
+        # фильтруем явные мусорные слова
+        if len(clean) < 3 or clean.lower().startswith("обновлено"):
+            continue
+        # эвристика: имена обычно из 2 слов
+        # отрезаем возможные лишние буквы в начале (К, Гл и т.п.)
+        clean = re.sub(r"^[КГЛР]\.?$", "", clean).strip()
+        if not clean:
+            continue
+        if current_role == "main":
+            if clean not in main:
+                main.append(clean)
+        elif current_role == "linesmen":
+            if clean not in linesmen:
+                linesmen.append(clean)
 
-        m = re.match(r"^\s*(\d{1,2})\s+([ЗНВ])\s+(.+?)\s*$", s)
-        if m and cur_line in ("1", "2", "3", "4"):
-            num = m.group(1)
-            pos = POS_MAP.get(m.group(2), "F")
-            name = m.group(3)
-            name = re.sub(r"\s{2,}", " ", name).strip().strip(" .,:;")
-            data[cur]["lines"][cur_line].append({"name": name, "pos": pos, "number": num})
+    # страховка: если роли не поймались — вытащим все имена в одну строку и порежем по 2-3 слову
+    if not main and not linesmen and lines:
+        blob = " ".join(lines)
+        blob = NAME_CLEAN_RX.sub(" ", blob)
+        # простая выборка «Имя Фамилия»
+        cand = re.findall(r"[А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z\.]+){1,2}", blob)
+        for i, nm in enumerate(cand):
+            (main if i < 2 else linesmen).append(nm.strip())
 
-    return data, refs
+    # ограничим до здравого минимума
+    main = main[:2]
+    linesmen = linesmen[:4]
 
-# -----------------------------
-# 5) Helpers
-# -----------------------------
-def get_pdf_from_query() -> bytes:
-    """
-    Поддерживает:
-      - ?url=... (прямой URL)
-      - ?season=1369&uid=897689 (khl-шаблон)
-    """
-    url = request.args.get("url")
-    season = request.args.get("season")
-    uid = request.args.get("uid")
+    return {"main": main, "linesmen": linesmen}
 
-    if url:
-        # если пришёл прямой url — тянем его (с теми же заголовками/обходом)
-        # пробуем угадать season/uid, иначе просто качаем как есть
-        m = re.search(r"/pdf/(\d{4})/(\d+)/game-\2-start-ru\.pdf", url)
-        if m:
-            return fetch_pdf_bytes(m.group(1), m.group(2))
-        # общий даунлоад (через cloudscraper)
-        headers = {"User-Agent": "Mozilla/5.0"}
-        scraper = cloudscraper.create_scraper()
-        r = scraper.get(url, headers=headers, timeout=25)
-        if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
-            return r.content
-        raise RuntimeError(f"http {r.status_code}: cannot fetch url")
-    if season and uid:
-        return fetch_pdf_bytes(season, uid)
-    raise RuntimeError("param 'url' or 'season&uid' required")
+# ---------------- Черновой парсер звеньев (как раньше) ----------------
+def draft_parse_lineups(words: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not words:
+        return {"home": {"team": "", "goalies": [], "lines": {}},
+                "away": {"team": "", "goalies": [], "lines": {}}}
 
-# -----------------------------
-# 6) Endpoints
-# -----------------------------
+    xs = [w["x0"] for w in words]
+    mid = (min(xs) + max(xs)) / 2
+    left = [w for w in words if w["x0"] <= mid]
+    right = [w for w in words if w["x0"] > mid]
+
+    def group(column: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
+        by_y: Dict[int, List[Dict[str, Any]]] = {}
+        for w in column:
+            y = int(round(w["y0"]))
+            by_y.setdefault(y, []).append(w)
+        lines = {"1": [], "2": [], "3": [], "4": []}
+        current = "1"
+        for y in sorted(by_y):
+            row = sorted(by_y[y], key=lambda z: z["x0"])
+            t = " ".join(x["w"] for x in row)
+            if "Звено" in t:
+                for k in ("1","2","3","4"):
+                    if f"Звено {k}" in t:
+                        current = k
+                        break
+                continue
+            m = re.search(r"(^|\s)(\d{1,2})\s+([ЗДDFGFНН])?\s*([A-Za-zА-Яа-яЁё\-\.'’]+(?:\s+[A-Za-zА-Яа-яЁё\-\.'’]+)?)", t)
+            if m:
+                num = m.group(2)
+                pos_raw = (m.group(3) or "").upper()
+                pos = "D" if any(x in pos_raw for x in ["Д","З","D"]) else ("F" if any(x in pos_raw for x in ["F","Н"]) else "")
+                name = m.group(4).strip(" .,-;:")
+                lines.setdefault(current, []).append({"number": num, "pos": pos, "name": name})
+        return lines
+
+    return {
+        "home": {"team": "", "goalies": [], "lines": group(left), "bench": []},
+        "away": {"team": "", "goalies": [], "lines": group(right), "bench": []},
+    }
+
+# ---------------- API ----------------
 @app.get("/health")
-def health() -> Response:
+def health():
     return jsonify({"ok": True, "engine": "ready"})
 
-@app.get("/ocr")
-def route_ocr() -> Response:
-    try:
-        pdf = get_pdf_from_query()
-        dpi = int(request.args.get("dpi", "300"))
-        text = ocr_text(pdf, dpi=dpi)
-        return jsonify({"ok": True, "engine": "ocr", "text_len": len(text), "snippet": text[:500]})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-
 @app.get("/extract")
-def route_extract() -> Response:
-    """
-    mode:
-      - words (по умолчанию) — парсит текстовый слой
-      - ocr — OCR fallback
-    """
-    mode = request.args.get("mode", "words").lower()
+def extract():
+    season = request.args.get("season","").strip()
+    uid = request.args.get("uid","").strip()
+    mode = (request.args.get("mode","words") or "words").lower()
+    if not season or not uid:
+        return jsonify({"ok": False, "error": "params 'season' and 'uid' required"}), 400
+    t0 = time.time()
     try:
-        pdf = get_pdf_from_query()
-        if mode == "ocr":
-            text = ocr_text(pdf, dpi=int(request.args.get("dpi", "300")))
-            lines = [x.strip() for x in text.replace("\xa0", " ").splitlines() if x.strip()]
-        else:
-            lines = page_words(pdf)
-
-        data, refs = rough_extract_struct(lines)
-        return jsonify({
-            "ok": True,
-            "engine": mode,
-            "data": data,
-            "referees": refs,
-            "source_url": request.args.get("url") or (
-                f"https://www.khl.ru/pdf/{request.args.get('season')}/{request.args.get('uid')}/game-{request.args.get('uid')}-start-ru.pdf"
-                if request.args.get("season") and request.args.get("uid") else None
-            )
-        })
+        pdf = fetch_pdf_bytes(season, uid)
     except Exception as e:
-        code = 400
-        msg = str(e)
-        if "403" in msg:
-            code = 403
-        return jsonify({"ok": False, "error": msg}), code
+        return jsonify({"ok": False, "error": str(e)}), 502
 
-# -----------------------------
-# 7) gunicorn entry
-# -----------------------------
+    src = f"https://www.khl.ru/pdf/{season}/{uid}/game-{uid}-start-ru.pdf"
+    try:
+        if mode == "text":
+            text = extract_text(pdf)
+            return jsonify({"ok": True, "engine": "text", "text_len": len(text),
+                            "text": text, "source_url": src, "duration_s": round(time.time()-t0,3)})
+        if mode == "draft":
+            words = extract_words(pdf)
+            data = draft_parse_lineups(words)
+            return jsonify({"ok": True, "engine": "draft", "data": data,
+                            "source_url": src, "duration_s": round(time.time()-t0,3)})
+        if mode == "refs":
+            refs = ocr_referees(pdf)
+            return jsonify({"ok": True, "engine": "ocr-refs", "referees": refs,
+                            "source_url": src, "duration_s": round(time.time()-t0,3)})
+        # default: words
+        words = extract_words(pdf)
+        return jsonify({"ok": True, "engine": "words", "words_total": len(words),
+                        "words": words[:5000], "source_url": src, "duration_s": round(time.time()-t0,3)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/ocr")
+def ocr_all():
+    season = request.args.get("season","").strip()
+    uid = request.args.get("uid","").strip()
+    if not season or not uid:
+        return jsonify({"ok": False, "error": "params 'season' and 'uid' required"}), 400
+    t0 = time.time()
+    pdf = fetch_pdf_bytes(season, uid)
+    # полный OCR последней страницы (на случай очень кривых файлов)
+    img = page_image(pdf, -1, zoom=3.0)
+    text = pytesseract.image_to_string(img, lang="rus+eng", config="--oem 1 --psm 6")
+    return jsonify({"ok": True, "engine": "ocr", "text_len": len(text), "text": text,
+                    "duration_s": round(time.time()-t0,3)})
+
 if __name__ == "__main__":
-    # локальный запуск
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")))
