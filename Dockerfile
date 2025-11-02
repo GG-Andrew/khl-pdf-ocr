@@ -1,22 +1,27 @@
+# Python образ
 FROM python:3.11-slim
 
-# Системные зависимости (poppler для pdf2image, tesseract с рус/англ)
-COPY apt.txt /tmp/apt.txt
-RUN apt-get update && xargs -a /tmp/apt.txt apt-get install -y --no-install-recommends \
+# Системные пакеты для Tesseract и рендеринга PDF в изображения
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
+    libglib2.0-0 libgl1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Переменные окружения для tesseract
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
-ENV PYTHONUNBUFFERED=1
-
-# Питон-зависимости
+# Каталог приложения
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
+
+# Сначала зависимости
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Код
-COPY app.py /app/app.py
+# Код приложения
+COPY app.py ./
+# (если у тебя есть players_master.csv / referees_master.csv — тоже скопируй)
+# COPY players_master.csv referees_master.csv ./
 
-# gunicorn
-EXPOSE 10000
-CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:10000", "app:app"]
+# Важно: Render прокидывает порт в $PORT
+ENV PORT=10000
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+
+# Gunicorn — продуктивный сервер
+CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:${PORT}", "app:app"]
