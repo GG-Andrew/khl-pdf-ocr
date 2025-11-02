@@ -1,28 +1,23 @@
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Системные пакеты: poppler для pdf2image, tesseract (включая рус. язык), либы для PyMuPDF
+# Системные зависимости и Tesseract с языками
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    poppler-utils \
-    tesseract-ocr \
-    tesseract-ocr-rus \
-    libglib2.0-0 \
-    libgl1 \
- && rm -rf /var/lib/apt/lists/*
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
+# Tesseract на Debian/Ubuntu кладёт модели сюда:
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
-
-# Ставим Python-зависимости
-COPY requirements.txt ./
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
-COPY . .
+COPY app.py .
 
-# Render сам пробрасывает $PORT. Откроем дефолтный порт для локала.
-EXPOSE 10000
+# Render передаст порт через $PORT, по умолчанию 8000
+ENV PORT=8000
+EXPOSE 8000
 
-# Старт
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["python", "app.py"]
