@@ -6,15 +6,13 @@ from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
 from PIL import Image
 
-# --- OCR fallback (tesseract) ---
 try:
     import pytesseract
     TESS_AVAILABLE = True
 except Exception:
     TESS_AVAILABLE = False
 
-# ====== Конфиг ======
-UA = "BETON-KHL OCR/2.0 (+https://results.beton-khl.ru)"
+UA = "BETON-KHL OCR/2.1 (+https://results.beton-khl.ru)"
 TIMEOUT = 20
 PDF_HEADERS = {
     "User-Agent": UA,
@@ -29,7 +27,7 @@ REFEREES_MASTER = "referees_master.csv"
 
 app = Flask(__name__)
 
-# ====== Справочники (опционально) ======
+# ========== helpers: load canonical maps ==========
 def load_master(path: str) -> Dict[str, str]:
     if not os.path.exists(path):
         return {}
@@ -37,12 +35,11 @@ def load_master(path: str) -> Dict[str, str]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for ln in f:
             ln = ln.strip()
-            if not ln or ln.startswith("#"):  # csv простого вида: raw;canon
+            if not ln or ln.startswith("#"):
                 continue
             parts = re.split(r"[;,]\s*", ln)
             if len(parts) >= 2:
-                raw = parts[0].strip()
-                canon = parts[1].strip()
+                raw, canon = parts[0].strip(), parts[1].strip()
                 if raw and canon:
                     mp[raw.lower()] = canon
     return mp
@@ -51,49 +48,76 @@ PLAYERS_MAP = load_master(PLAYERS_MASTER)
 REFS_MAP    = load_master(REFEREES_MASTER)
 
 def canonize(name: str, mapping: Dict[str,str]) -> str:
-    if not name: return name
-    key = name.lower().strip()
+    key = (name or "").lower().strip()
     return mapping.get(key, name)
 
-# ====== HTTP ======
+# ========== HTTP ==========
 def fetch_pdf(url: str, season: int|None=None, uid: int|None=None) -> bytes:
     headers = PDF_HEADERS.copy()
-    # Тёплый прогрев Referer
     if season and uid:
         ref = REF_PREVIEW_TMPL.format(season=season, uid=uid)
     else:
-        # попытаемся вытащить season/uid из самой ссылки
         m = re.search(r"/(\d{4})/(\d{6})/", url)
         ref = REF_PREVIEW_TMPL.format(season=m.group(1), uid=m.group(2)) if m else "https://www.khl.ru/"
     headers["Referer"] = ref
 
+    r = requests.get(ref, headers={"User-Agent": UA}, timeout=8)
+    time.sleep(0.4)
     r = requests.get(url, headers=headers, timeout=TIMEOUT)
     if r.status_code == 403:
-        # ещё раз после явного GET превью
-        try:
-            requests.get(ref, headers={"User-Agent": UA}, timeout=8)
-            time.sleep(0.8)
-        except Exception:
-            pass
+        time.sleep(0.6)
         r = requests.get(url, headers=headers, timeout=TIMEOUT)
     r.raise_for_status()
     return r.content
 
-# ====== low-level utils ======
-def extract_words(pdf_bytes: bytes) -> List[dict]:
-    """Возвращает список слов (bbox + text) первой страницы."""
-    words: List[dict] = []
+# ========== low-level text extraction ==========
+@dataclass
+class Word:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    text: str
+
+def extract_words(pdf_bytes: bytes) -> Tuple[List[Word], Tuple[float,float]]:
+    words: List[Word] = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         if doc.page_count == 0:
-            return words
+            return [], (0.0,0.0)
         page = doc.load_page(0)
+        w, h = page.rect.width, page.rect.height
         for b in page.get_text("words"):
-            # b: (x0,y0,x1,y1,"text", block_no, line_no, word_no)
-            words.append({
-                "x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3],
-                "text": b[4]
-            })
-    return words
+            words.append(Word(b[0], b[1], b[2], b[3], b[4]))
+    return words, (w, h)
+
+def words_to_lines(words: List[Word], y_tol: float=2.2) -> List[str]:
+    """Группируем слова по строкам по y, потом сортируем по x, склеиваем."""
+    if not words: return []
+    ws = sorted(words, key=lambda w:(w.y0, w.x0))
+    lines: List[List[Word]] = []
+    cur: List[Word] = []
+    last_y = None
+    for w in ws:
+        if last_y is None or abs(w.y0 - last_y) <= y_tol:
+            cur.append(w)
+            last_y = w.y0 if last_y is None else (last_y + (w.y0-last_y)*0.0)
+        else:
+            lines.append(sorted(cur, key=lambda k:k.x0))
+            cur = [w]
+            last_y = w.y0
+    if cur:
+        lines.append(sorted(cur, key=lambda k:k.x0))
+    out = []
+    for ln in lines:
+        out.append(" ".join(tok.text for tok in ln))
+    return out
+
+def split_columns_words(words: List[Word], page_w: float) -> Tuple[List[Word], List[Word]]:
+    if not words: return [], []
+    mid = page_w/2.0
+    left = [w for w in words if (w.x0+w.x1)/2.0 <= mid]
+    right= [w for w in words if (w.x0+w.x1)/2.0  > mid]
+    return left, right
 
 def page_to_image(pdf_bytes: bytes, dpi: int=300) -> Image.Image:
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -103,224 +127,297 @@ def page_to_image(pdf_bytes: bytes, dpi: int=300) -> Image.Image:
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         return img
 
-def ocr_image(img: Image.Image, lang: str="rus+eng") -> str:
-    if not TESS_AVAILABLE:
-        return ""
-    # Tesseract в контейнере обычно уже знает tessdata prefix
+def ocr_block(img: Image.Image, lang: str="rus+eng") -> str:
+    if not TESS_AVAILABLE: return ""
     return pytesseract.image_to_string(img, lang=lang, config="--psm 6")
 
-# ====== high-level parsing ======
-@dataclass
-class Roster:
-    team: str = ""
-    goalies: List[Dict[str,str]] = None
-    lines: Dict[str, List[Dict[str,str]]] = None
-    bench: List[Dict[str,str]] = None
-
-def split_columns(words: List[dict]) -> Tuple[List[str], List[str]]:
-    """Разделяем на левую/правую колонку по median X."""
-    if not words:
-        return [], []
-    xs = sorted([(w["x0"]+w["x1"])/2.0 for w in words])
-    median_x = xs[len(xs)//2]
-    left = " ".join([w["text"] for w in words if (w["x0"]+w["x1"])/2.0 <= median_x])
-    right= " ".join([w["text"] for w in words if (w["x0"]+w["x1"])/2.0 >  median_x])
-    # Уберём двойные пробелы
-    left = re.sub(r"\s{2,}", " ", left)
-    right= re.sub(r"\s{2,}", " ", right)
-    return left, right
-
+# ========== parsing ==========
 NAME_RE = r"[А-ЯЁ][а-яё]+(?:[-\s][А-ЯЁа-яё\.]+){0,3}"
 NUM_RE  = r"\d{1,2}"
-ROLE_RE = r"(?:Вратар[ьи]|Вратари|Голкипер[ы]|З|Н|Нападающ[ие]|Защитник[и])"
-SKIP_TOK = {"p.", "р.", "р", "p", "г."}
+ROLE_LET = {"З":"D","Н":"F","В":"G"}
 
-def clean_role_words(s: str) -> str:
-    s = re.sub(r"\b(Главн\w*|Линейн\w*|судья|судьи|Резервн\w*)\b", " ", s, flags=re.I)
-    return re.sub(r"\s{2,}", " ", s).strip(" ,.;:")
+def clean_space(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", s).strip(" \t.;,:")
 
-def parse_referees(text: str) -> Tuple[List[str], List[str]]:
-    """Достаём имена после тегов «Главный судья», «Линейный судья» (в любой форме)."""
-    # Варианты написаний:
-    # «Главные судьи: Фам Имя, Фам Имя», «Главный судья: ...»
-    # «Линейные судьи: ...»
-    mains: List[str] = []
-    lines: List[str] = []
+def clean_roles_from_name(s: str) -> str:
+    s = re.sub(r"\b(Главн\w*|Линейн\w*|судья|судьи|Резервн\w*|Обновлено[:\s]*\d{1,2}\.\d{1,2}\.\d{4}.*)$", " ", s, flags=re.I)
+    s = re.sub(r"\b(Обновлено|РЕЗЕРВНЫЙ|Резервный)\b", " ", s, flags=re.I)
+    s = clean_space(s)
+    return s
 
-    # Нормализуем запятые/точки/переносы
-    t = text.replace("\n", " ")
-    t = re.sub(r"\s{2,}", " ", t)
+def parse_referees_from_text(txt: str) -> Tuple[List[str], List[str]]:
+    t = txt.replace("\n", " ")
+    t = clean_space(t)
+    mains, lines = [], []
 
-    # Поищем группы с ролями:
-    blocks = re.findall(r"(Главн\w+\s+суд[ьяи]:?\s*([^:]+?))(?:Линейн\w+\s+суд[ьи]:?|$)", t, flags=re.I)
-    if blocks:
-        for full, names in blocks:
-            parts = re.split(r"[;,]\s*|\s{2,}", names)
+    # 1) Явные блоки
+    for block, bucket in [
+        (r"Главн\w+\s+суд[ьяи]:?\s*([^:]+?)(?=Линейн\w+\s+суд|$)", mains),
+        (r"Линейн\w+\s+суд[ьи]:?\s*([^:]+)", lines)
+    ]:
+        for m in re.finditer(block, t, flags=re.I):
+            chunk = m.group(1)
+            parts = re.split(r"[;,]|\s{2,}", chunk)
             for p in parts:
-                name = clean_role_words(p).strip()
-                if len(name.split()) >= 2 and re.match(r"^[А-ЯЁA-Z]", name):
-                    mains.append(name)
-    # Линейные
-    line_blocks = re.findall(r"(Линейн\w+\s+суд[ьи]:?\s*([^:]+))", t, flags=re.I)
-    if line_blocks:
-        for _, names in line_blocks:
-            parts = re.split(r"[;,]\s*|\s{2,}", names)
-            for p in parts:
-                name = clean_role_words(p).strip()
-                if len(name.split()) >= 2 and re.match(r"^[А-ЯЁA-Z]", name):
-                    lines.append(name)
+                name = clean_roles_from_name(p)
+                if re.match(r"^[А-ЯЁA-Z]", name) and len(name.split()) >= 2:
+                    bucket.append(name)
 
-    # Если всё пусто — попробуем простую маску «Фам Имя» возле слова «суд»
+    # 2) Если пусто — резервная маска «... судья ... Фам Имя»
     if not mains and not lines:
-        near = re.findall(r"(?:суд[ьяи]\s*[:\-]?\s*)("+NAME_RE+r"(?:\s+"+NAME_RE+r")?)", t, flags=re.I)
-        for n in near:
-            nm = clean_role_words(n)
-            if nm: mains.append(nm)
+        for m in re.finditer(r"(?:суд[ьяи]\s*[:\-]?\s*)("+NAME_RE+r"(?:\s+"+NAME_RE+r")?)", t, flags=re.I):
+            nm = clean_roles_from_name(m.group(1))
+            if nm:
+                mains.append(nm)
 
-    # Канонизация
-    mains = [canonize(n, REFS_MAP) for n in mains]
-    lines = [canonize(n, REFS_MAP) for n in lines]
-
-    # Дедуп
-    def _uniq(seq): 
+    # Канонизация + дедуп
+    def uniq(seq):
         out=[]; seen=set()
         for x in seq:
-            if x not in seen:
+            x = canonize(x, REFS_MAP)
+            if x and x not in seen:
                 seen.add(x); out.append(x)
         return out
-    return _uniq(mains), _uniq(lines)
+    return uniq(mains), uniq(lines)
 
-def parse_goalies_and_lines(col_text: str) -> Roster:
+def parse_team_name(col_lines: List[str]) -> str:
+    # Берём первую длинную капсовую фразу, не содержащую «СОСТАВ»
+    caps = []
+    for ln in col_lines[:10]:
+        m = re.search(r"([А-ЯЁA-Z][А-ЯЁA-Z\s\-\.\(\)]{6,})", ln)
+        if m:
+            cand = clean_space(m.group(1))
+            if "СОСТАВ" not in cand and "КОМАНД" not in cand:
+                caps.append(cand)
+    if caps:
+        # Самая длинная
+        return max(caps, key=len)
+    return ""
+
+def scan_goalies_tokens(col_lines: List[str]) -> List[Dict[str,str]]:
     """
-    Ожидаем шаблон:
-    Вратари: NN Фам Имя; NN Фам Имя ...
-    1 звено: Z/N + 5 записей; 2 звено: ...
+    Ищем подряд токены формата:
+    (опц.) 'В'  <№>  <Фам Имя ...>   пока не встретим новое 'З/Н/В' + № или заголовок звена.
     """
-    rt = Roster(team="", goalies=[], lines={"1":[], "2":[], "3":[], "4":[]}, bench=[])
-    t = re.sub(r"\s{2,}", " ", col_text)
-    # Команда (верх страницы часто содержит «СОСТАВЫ КОМАНД <TEAM>» — берём самое длинное caps-слово)
-    m = re.search(r"([А-ЯЁA-Z][А-ЯЁA-Z\s\-]{6,})", t)
+    text = " \n".join(col_lines)
+    # Обрежем до блока «Вратар» если он есть (не обязательно в PDF)
+    m = re.search(r"Вратар\w*[:\s]+(.+)$", text, flags=re.I|re.S)
     if m:
-        cand = m.group(1).strip()
-        # отфильтруем шум вроде «СОСТАВЫ КОМАНД»
-        if "СОСТАВ" in cand:
-            pass
-        else:
-            rt.team = cand
+        text = m.group(1)
 
-    # Вратари
-    # Примеры: "Вратари: 31 Озолин Ярослав, 53 Долганов Филипп, 30 Любалин Семён"
-    gblock = re.search(r"(?:Вратар[ьи]|Голкипер\w*):?\s+(.+?)(?:\s{0,3}1\s?[звенаип\.]|1\s?звено|1:|Первое\s?звено|$)", t, flags=re.I)
-    if gblock:
-        raw_g = gblock.group(1)
-        # Разрезаем по ; или , или "  "
-        raw_parts = re.split(r"[;,\|]\s*|\s{2,}", raw_g)
-        for p in raw_parts:
-            p = p.strip(" .")
+    toks = re.split(r"\s+", text)
+    out: List[Dict[str,str]] = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        # старт записи: (В)? + число
+        if (t in ("В", "Вратарь", "Вратари")) or re.fullmatch(NUM_RE, t):
+            # если первая буква роль, следующая должна быть номер
+            j = i
+            role = ""
+            if t in ("В", "Вратарь", "Вратари"):
+                j += 1
+                if j>=len(toks) or not re.fullmatch(NUM_RE, toks[j]):
+                    i += 1; continue
+                role = "G"
+            else:
+                role = ""  # может быть З/Н без «В»
+            # номер
+            num = toks[j]
+            if not re.fullmatch(NUM_RE, num):
+                i += 1; continue
+            j += 1
+            # имя — собираем, пока не встретим «З/Н/В + число», «<цифра> звено», запятую-разделитель и т.п.
+            name_parts = []
+            while j < len(toks):
+                nxt = toks[j]
+                # стоп-условия
+                if nxt in ("З","Н","В") and (j+1)<len(toks) and re.fullmatch(NUM_RE, toks[j+1]): break
+                if re.fullmatch(r"[1-4]", nxt) and (j+1)<len(toks) and "звен" in toks[j+1].lower(): break
+                if re.fullmatch(NUM_RE, nxt) and name_parts: break
+                # не тащим служебные куски
+                if nxt.lower() in {"обновлено","резервный","резервная","резерв"}: break
+                name_parts.append(nxt)
+                j += 1
+            name = clean_space(" ".join(name_parts))
+            name = re.sub(r"^[ЗНВ]\s+", "", name)  # если прилипла буква роли
+            name = canonize(name, PLAYERS_MAP)
+            # фильтр по виду имени
+            if re.search(r"[А-ЯЁа-яё]{3,}", name):
+                out.append({"number": num, "name": name, "gk_status": ""})
+            i = j
+            continue
+        i += 1
+    return out
+
+def scan_lines_block(col_lines: List[str]) -> Dict[str, List[Dict[str,str]]]:
+    text = " \n".join(col_lines)
+    # Упростим маркеры звеньев
+    text = re.sub(r"Первое\s*звено", "1 звено", text, flags=re.I)
+    text = re.sub(r"Второе\s*звено", "2 звено", text, flags=re.I)
+    text = re.sub(r"Третье\s*звено", "3 звено", text, flags=re.I)
+    text = re.sub(r"Четвёртое\s*звено|Четвертое\s*звено", "4 звено", text, flags=re.I)
+
+    lines = {"1":[], "2":[], "3":[], "4":[]}
+
+    def grab(no: int) -> str:
+        pat = rf"\b{no}\s*звено[:]?\s*(.+?)(?=\b{no+1}\s*звено|$)"
+        m = re.search(pat, text, flags=re.I|re.S)
+        return m.group(1) if m else ""
+
+    def parse_members(seg: str) -> List[Dict[str,str]]:
+        # режем по запятым/точкам с пробелами/двойным пробелам
+        raw = re.split(r"[;,]\s*|\s{2,}", seg)
+        out=[]
+        for p in raw:
+            p = clean_space(p)
             if not p: continue
-            # номер + имя
-            m2 = re.match(rf"({NUM_RE})\s+({NAME_RE})", p)
-            if m2:
-                num = m2.group(1)
-                name = m2.group(2).strip()
-                name = canonize(name, PLAYERS_MAP)
-                rt.goalies.append({"number": num, "name": name, "gk_status": ""})
-
-    # Звенья
-    # Ищем блоки вида "1 звено: ... 2 звено: ... 3 звено: ... 4 звено: ..."
-    # Допускаем варианты "1:", "1 звено", "Первое звено" и т.п.
-    def grab_line(no: int) -> List[Dict[str,str]]:
-        pat = rf"(?:\b{no}\s*(?:звено|звена|:)?|{['Первое','Второе','Третье','Четвёртое'][no-1]}\s*звено)\s*[:\-]?\s*(.+?)(?=\b{no+1}\s*(?:звено|:)|$)"
-        m = re.search(pat, t, flags=re.I)
-        out: List[Dict[str,str]] = []
-        if not m:
-            return out
-        segment = m.group(1)
-        items = re.split(r"[;,\|]\s*|\s{2,}", segment)
-        for it in items:
-            it = it.strip(" .")
-            # позиции могут быть «З» или «Н», иногда буквы перед номером; вынем №, позицию и имя
-            m3 = re.match(rf"(?:(З|Н)\s+)?({NUM_RE})\s+({NAME_RE})", it)
-            if m3:
-                pos = m3.group(1) or ""
-                num = m3.group(2)
-                name= m3.group(3)
-                pos_eng = {"З":"D","Н":"F"}.get(pos, "")
-                out.append({"name": canonize(name, PLAYERS_MAP), "pos": pos_eng or "F", "number": num})
+            # варианты:
+            # "З 24 Сериков Артём"  |  "24 Сериков Артём"  | "Н 71 Белозёров Андрей"
+            m = re.match(rf"(?:(З|Н|В)\s+)?({NUM_RE})\s+({NAME_RE})", p)
+            if not m:
+                # fallback: иногда позиция/номер склеены или номер в конце
+                m = re.match(rf"(?:(З|Н|В)\s+)?({NAME_RE})\s+({NUM_RE})", p)
+                if m:
+                    role = m.group(1) or ""
+                    name = canonize(m.group(2), PLAYERS_MAP)
+                    num  = m.group(3)
+                    pos  = ROLE_LET.get(role or "", "F")
+                    out.append({"name":name, "pos":pos, "number":num})
+                continue
+            role = m.group(1) or ""
+            num  = m.group(2)
+            name = canonize(m.group(3), PLAYERS_MAP)
+            pos  = ROLE_LET.get(role or "", "F")
+            out.append({"name":name, "pos":pos, "number":num})
         return out
 
     for i in (1,2,3,4):
-        rt.lines[str(i)] = grab_line(i)
+        seg = grab(i)
+        if seg:
+            lines[str(i)] = parse_members(seg)
+    return lines
 
-    return rt
+@dataclass
+class Roster:
+    team: str
+    goalies: List[Dict[str,str]]
+    lines: Dict[str, List[Dict[str,str]]]
+    bench: List[Dict[str,str]]
 
-# ====== основной пайплайн ======
-def analyze_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
-    # 1) PyMuPDF слова
-    words = extract_words(pdf_bytes)
-    left_text, right_text = split_columns(words)
+def parse_roster_from_column(col_words: List[Word]) -> Roster:
+    col_lines = words_to_lines(col_words, y_tol=2.4)
+    team = parse_team_name(col_lines)
+    goalies = scan_goalies_tokens(col_lines)
+    lines = scan_lines_block(col_lines)
+    return Roster(team=team or "", goalies=goalies, lines=lines, bench=[])
 
-    # если совсем пусто — OCR
+# ========== main pipeline ==========
+def analyze_pdf(pdf_bytes: bytes, mode: str="auto", dpi: int=300, debug: bool=False) -> Dict[str, Any]:
     ocr_used = False
-    if len(left_text) + len(right_text) < 200:
-        img = page_to_image(pdf_bytes, dpi=300)
-        full_txt = ocr_image(img, "rus+eng")
+    words, (pw, ph) = extract_words(pdf_bytes)
+
+    if mode not in ("auto","words","ocr"):
+        mode = "auto"
+
+    if mode == "ocr" or (mode=="auto" and not words):
+        img = page_to_image(pdf_bytes, dpi=dpi)
         ocr_used = True
-        # Простейший «сплит» пополам по ширине, если PyMuPDF не дал слова
+        full_txt = ocr_block(img, "rus+eng")
+        # чтобы сохранить логику «двух колонок» при OCR — режем картинку пополам
         w, h = img.size
-        left_img  = img.crop((0, 0, w//2, h))
-        right_img = img.crop((w//2, 0, w, h))
-        left_text  = ocr_image(left_img,  "rus+eng")
-        right_text = ocr_image(right_img, "rus+eng")
+        left_img, right_img = img.crop((0,0,w//2,h)), img.crop((w//2,0,w,h))
+        left_txt  = ocr_block(left_img,  "rus+eng")
+        right_txt = ocr_block(right_img, "rus+eng")
+        # подменяем words «фиктивными» строками — ниже мы используем только текстовые парсеры
+        left_words, right_words = [], []
+        left_lines  = [ln for ln in left_txt.splitlines() if ln.strip()]
+        right_lines = [ln for ln in right_txt.splitlines() if ln.strip()]
+        left_text_join  = "\n".join(left_lines)
+        right_text_join = "\n".join(right_lines)
+        # судьи — из полного текста
+        mains, linesmen = parse_referees_from_text(full_txt)
+        # составы — из левой/правой «полу-картинки»
+        # примитивный разбор: конвертим строки в фиктивные Word (для переиспользования парсеров)
+        def fake_words(lines):
+            ww=[]; y=0.0
+            for ln in lines:
+                x = 0.0
+                for tok in ln.split():
+                    ww.append(Word(x, y, x+len(tok)*6, y+8, tok))
+                    x += (len(tok)+1)*6
+                y += 10.0
+            return ww
+        left_wf, right_wf = fake_words(left_lines), fake_words(right_lines)
+        home = parse_roster_from_column(left_wf)
+        away = parse_roster_from_column(right_wf)
 
-    # 2) Судьи — берём весь «склеенный» текст, чтобы не потерять заголовки
-    full_text = " ".join([w["text"] for w in words]) if words else (left_text + " " + right_text)
-    mains, lines = parse_referees(full_text)
+        # проставим статусы киперов
+        def mark(gl):
+            if not gl: return
+            if len(gl)==1: gl[0]["gk_status"]="starter"
+            else:
+                gl[0]["gk_status"]="starter"; gl[-1]["gk_status"]="reserve"
 
-    # 3) Составы
-    home = parse_goalies_and_lines(left_text)
-    away = parse_goalies_and_lines(right_text)
+        mark(home.goalies); mark(away.goalies)
 
-    # 4) статусы киперов (эвристика: первый — starter, последний — reserve)
-    def mark_goalies(gl: List[Dict[str,str]]):
+        result = {
+            "ok": True,
+            "engine": "ocr",
+            "data": {
+                "home":{"team":home.team,"goalies":home.goalies,"lines":home.lines,"bench":[]},
+                "away":{"team":away.team,"goalies":away.goalies,"lines":away.lines,"bench":[]},
+            },
+            "referees":{"main":mains,"linesmen":linesmen},
+            "referee_entries":(
+                [{"role":"Главный судья","name":n} for n in mains] +
+                [{"role":"Линейный судья","name":n} for n in linesmen]
+            )
+        }
+        if debug:
+            result["_debug"]={"left_text":left_text_join, "right_text":right_text_join, "full_text":full_txt[:5000]}
+        return result
+
+    # words / auto
+    left_words, right_words = split_columns_words(words, pw)
+    # Судьи — из всего текста слов
+    full_text = " ".join(w.text for w in words)
+    mains, linesmen = parse_referees_from_text(full_text)
+
+    # Составы
+    home = parse_roster_from_column(left_words)
+    away = parse_roster_from_column(right_words)
+
+    # эвристика статусов киперов
+    def mark(gl):
         if not gl: return
-        if len(gl) == 1:
-            gl[0]["gk_status"] = "starter"
-        elif len(gl) >= 2:
-            gl[0]["gk_status"] = "starter"
-            gl[-1]["gk_status"] = "reserve"
+        if len(gl)==1: gl[0]["gk_status"]="starter"
+        else:
+            gl[0]["gk_status"]="starter"; gl[-1]["gk_status"]="reserve"
+    mark(home.goalies); mark(away.goalies)
 
-    mark_goalies(home.goalies)
-    mark_goalies(away.goalies)
-
-    return {
+    result = {
         "ok": True,
         "engine": "words" if not ocr_used else "ocr",
         "data": {
-            "home": {
-                "team": home.team,
-                "goalies": home.goalies,
-                "lines": home.lines,
-                "bench": home.bench or []
-            },
-            "away": {
-                "team": away.team,
-                "goalies": away.goalies,
-                "lines": away.lines,
-                "bench": away.bench or []
-            }
+            "home":{"team":home.team,"goalies":home.goalies,"lines":home.lines,"bench":[]},
+            "away":{"team":away.team,"goalies":away.goalies,"lines":away.lines,"bench":[]},
         },
-        "referees": {
-            "main": mains,
-            "linesmen": lines
-        },
-        "referee_entries": (
-            [{"role":"Главный судья","name": n} for n in mains] +
-            [{"role":"Линейный судья","name": n} for n in lines]
+        "referees":{"main":mains,"linesmen":linesmen},
+        "referee_entries":(
+            [{"role":"Главный судья","name":n} for n in mains] +
+            [{"role":"Линейный судья","name":n} for n in linesmen]
         )
     }
+    if debug:
+        result["_debug"]={
+            "left_lines": words_to_lines(left_words),
+            "right_lines": words_to_lines(right_words),
+            "full_text": full_text[:5000]
+        }
+    return result
 
-# ====== HTTP endpoints ======
+# ========== HTTP ==========
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "engine": "ready"})
@@ -330,6 +427,10 @@ def extract():
     url = request.args.get("url", "").strip()
     season = request.args.get("season", "").strip()
     uid = request.args.get("uid", "").strip()
+    mode = request.args.get("mode", "auto").strip().lower()
+    dpi  = int(request.args.get("dpi", "300"))
+    debug= request.args.get("debug","0") in ("1","true","yes","on")
+
     try:
         if url:
             pdf_url = url
@@ -342,11 +443,13 @@ def extract():
             s_int = int(season); u_int = int(uid)
             pdf_url = f"https://www.khl.ru/pdf/{s_int}/{u_int}/game-{u_int}-start-ru.pdf"
 
+        t0 = time.time()
         pdf = fetch_pdf(pdf_url, s_int, u_int)
-        data = analyze_pdf(pdf)
+        data = analyze_pdf(pdf, mode=mode, dpi=dpi, debug=debug)
         data["source_url"] = pdf_url
-        data["duration_s"] = round(0.0 + 0.0, 3)  # (можно засечь реально при желании)
+        data["duration_s"] = round(time.time()-t0, 3)
         return jsonify(data)
+
     except requests.HTTPError as e:
         return jsonify({"ok": False, "error": f"http {e.response.status_code}", "detail": str(e)}), 502
     except Exception as e:
