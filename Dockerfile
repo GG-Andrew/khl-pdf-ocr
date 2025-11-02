@@ -1,18 +1,24 @@
+# ---- Base image
 FROM python:3.11-slim
 
+# Системные зависимости для PyMuPDF, Tesseract (если понадобится в дальнейшем)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
-    libglib2.0-0 libgl1 && \
-    rm -rf /var/lib/apt/lists/*
+    libglib2.0-0 libgl1 libpoppler-cpp0 \
+    && rm -rf /var/lib/apt/lists/*
 
+# Рабочая директория
 WORKDIR /app
 
-COPY requirements.txt ./
+# Устанавливаем Python-зависимости
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+# Копируем код
+COPY . .
 
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+# Чтобы логи сразу шли в stdout
+ENV PYTHONUNBUFFERED=1
 
-# ВАЖНО: shell-форма, чтобы $PORT подставился Render'ом
-CMD sh -c 'gunicorn -w 2 -b 0.0.0.0:$PORT app:app'
+# Запуск (PORT даёт Render)
+CMD sh -c "gunicorn app:app -b 0.0.0.0:${PORT:-10000} -w 2 --timeout 120"
