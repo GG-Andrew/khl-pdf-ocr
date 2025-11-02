@@ -1,0 +1,5 @@
+curl
+poppler-utils
+tesseract-ocr
+tesseract-ocr-rus
+tesseract-ocr-eng
