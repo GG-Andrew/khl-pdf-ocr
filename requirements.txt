@@ -1,5 +1,6 @@
-flask==3.0.3
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
 requests==2.32.3
+pillow==10.4.0
+pdf2image==1.17.0
 pytesseract==0.3.13
-Pillow==10.4.0
-PyMuPDF==1.24.10
