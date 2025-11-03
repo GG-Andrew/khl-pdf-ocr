@@ -1,15 +1,24 @@
-FROM python:3.12-slim
+# Базовый образ
+FROM python:3.11-slim
 
-# системные либы для PyMuPDF
+# Устанавливаем системные зависимости + Tesseract с рус/англ языковыми пакетами
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 \
-  && rm -rf /var/lib/apt/lists/*
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
+    libglib2.0-0 libgl1 \
+ && rm -rf /var/lib/apt/lists/*
 
+# Рабочая папка
 WORKDIR /app
-COPY requirements.txt .
+
+# Устанавливаем зависимости Python
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# Копируем приложение
+COPY app.py ./
 
-# Render сам подставит $PORT
-CMD ["gunicorn", "app:app", "-b", "0.0.0.0:$PORT", "-w", "2", "--timeout", "120"]
+# Tesseract будет искать языки здесь
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+
+# Стартуем через gunicorn; Render сам подставит $PORT
+CMD bash -lc 'gunicorn app:app -b 0.0.0.0:${PORT:-8000} -w 2 --timeout 120'
