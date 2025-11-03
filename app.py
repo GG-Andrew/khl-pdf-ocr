@@ -1,271 +1,346 @@
-# app.py
-# KHL PDF -> JSON (refs + meta)
-# безопасный сервер: без tesseract, устойчив к ошибкам, с прокси khl-pdf worker
-
 import os
 import io
 import re
+import json
 import time
-from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
 
-from flask import Flask, jsonify, request
 import requests
+import cloudscraper
+from flask import Flask, request
 
-# PyMuPDF (fitz) — только для чтения текстового слоя
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
+import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
 
-# ------------ Config ------------
-KHL_PDF_PROXY = os.getenv("KHL_PDF_PROXY", "").rstrip("/")  # например: https://pdf2.palladiumgames2d.workers.dev
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/121.0.0.0 Safari/537.36",
-    "Accept": "application/pdf,*/*",
-    "Accept-Language": "ru,en;q=0.9",
-    "Referer": "https://www.khl.ru/",
-}
-
-# ------------ App ------------
+# ------------------------------
+# Flask + JSON UTF-8 без \uXXXX
+# ------------------------------
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "engine": "ready"})
+def j(data: dict, status: int = 200):
+    return app.response_class(
+        json.dumps(data, ensure_ascii=False),
+        status=status,
+        mimetype="application/json; charset=utf-8",
+    )
 
-# ------------ Helpers ------------
+# ------------------------------
+# Конфигурация загрузки PDF
+# ------------------------------
+KHL_PDF_PROXY = os.getenv("KHL_PDF_PROXY", "").rstrip("/")
+RAW_HEADERS = os.getenv("KHL_PDF_HEADERS", "").strip()
+EXTRA_HEADERS = {}
+if RAW_HEADERS:
+    try:
+        EXTRA_HEADERS = json.loads(RAW_HEADERS)
+    except Exception:
+        EXTRA_HEADERS = {"Referer": "https://www.khl.ru"}
+else:
+    EXTRA_HEADERS = {"Referer": "https://www.khl.ru"}
 
-def pdf_url(season: str, uid: str) -> str:
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/119.0 Safari/537.36"
+)
+
+def build_pdf_url(season: str, uid: str) -> str:
     return f"https://www.khl.ru/pdf/{season}/{uid}/game-{uid}-start-ru.pdf"
 
-def proxied_pdf_url(season: str, uid: str) -> str:
-    assert KHL_PDF_PROXY, "proxy not configured"
-    # твой воркер ждёт путь /khlpdf/<season>/<uid>/game-<uid>-start-ru.pdf
-    return f"{KHL_PDF_PROXY}/khlpdf/{season}/{uid}/game-{uid}-start-ru.pdf"
+def build_proxy_url(season: str, uid: str) -> Optional[str]:
+    if not KHL_PDF_PROXY:
+        return None
+    return f"{KHL_PDF_PROXY}/{season}/{uid}/game-{uid}-start-ru.pdf"
 
-def load_pdf_bytes(season: str, uid: str) -> Tuple[bytes, str]:
+def fetch_pdf_bytes(season: str, uid: str) -> bytes:
     """
-    Возвращает (pdf_bytes, source_url). Сначала пробуем воркер, иначе напрямую.
+    1) Пытаемся cloudscraper напрямую (часто хватает)
+    2) При 403 / неуспехе — через Cloudflare Worker-прокси
     """
-    last_err = None
+    url = build_pdf_url(season, uid)
 
-    # 1) Пробуем прокси (если задан)
-    if KHL_PDF_PROXY:
-        try:
-            u = proxied_pdf_url(season, uid)
-            r = requests.get(u, timeout=25)
-            if r.ok and r.content.startswith(b"%PDF"):
-                return r.content, u
-            last_err = f"proxy status={r.status_code}"
-        except Exception as e:
-            last_err = f"proxy error: {e}"
-
-    # 2) Прямая загрузка
+    # direct try
     try:
-        u2 = pdf_url(season, uid)
-        r = requests.get(u2, headers=DEFAULT_HEADERS, timeout=25)
-        if r.ok and r.content.startswith(b"%PDF"):
-            return r.content, u2
-        last_err = f"direct status={r.status_code}"
-    except Exception as e:
-        last_err = f"direct error: {e}"
+        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        r = scraper.get(url, headers={"User-Agent": UA, **EXTRA_HEADERS}, timeout=20)
+        if r.status_code == 200 and r.content and r.content.startswith(b"%PDF"):
+            return r.content
+        # если не PDF или 4xx — упадём в прокси
+    except Exception:
+        pass
 
-    raise RuntimeError(f"unable to fetch pdf ({last_err})")
+    # proxy try
+    purl = build_proxy_url(season, uid)
+    if purl:
+        r2 = requests.get(purl, headers={"User-Agent": UA}, timeout=25)
+        if r2.status_code == 200 and r2.content and r2.content.startswith(b"%PDF"):
+            return r2.content
+        raise RuntimeError(f"proxy fetch failed: {r2.status_code}")
+    raise RuntimeError("direct fetch failed (and no proxy)")
 
-# ---- text extract with fitz ----
+# ------------------------------
+# Извлечение МЕТА (date/time/teams) через words
+# ------------------------------
+RE_DATE = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
+RE_TIME = re.compile(r"\b([01]\d|2[0-3]):[0-5]\d\b")
 
-def extract_text_pages(pdf_bytes: bytes, max_pages: int = 2) -> str:
-    if fitz is None:
-        raise RuntimeError("PyMuPDF not available")
+def parse_match_meta_words(pdf_bytes: bytes) -> Dict[str, Any]:
+    """
+    Извлекаем быстрой «текстовой» выборкой:
+    - teams (две верхние «капсом» строки около шапки)
+    - date/time_msk (любые первые встреченные в верхней половине)
+    Сильно упрощённо, но на твоих протоколах даёт стабильный результат.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = min(len(doc), max_pages)
-    chunks = []
-    for i in range(pages):
-        page = doc.load_page(i)
-        # текстовый слой (без OCR)
-        chunks.append(page.get_text("text"))
-    return "\n".join(chunks)
+    page = doc[0]
 
-# ---- parsing ----
+    # берем полный текст и первые 80 строк — этого хватает
+    full_text = page.get_text("text")
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+    head = lines[:80]
 
-ROLE_WORDS = r"(Главн\w*\s+судья|Линейн\w*\s+судья|Резервн\w+)"
-DATE_RE = r"(\d{2}\.\d{2}\.\d{4})"
-TIME_RE = r"(\d{2}[:\.]\d{2})"
+    # Дата/время
+    date = ""
+    time_msk = ""
+    for ln in head:
+        if not date:
+            m = RE_DATE.search(ln)
+            if m:
+                date = m.group(1)
+        if not time_msk:
+            m = RE_TIME.search(ln)
+            if m:
+                time_msk = m.group(1)
+        if date and time_msk:
+            break
 
-def normalize_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s, flags=re.M).strip()
+    # Команды: ищем две длинные UPPERCASE-строки рядом со словом «СОСТАВ»
+    # или рядом с «Гости/Хозяева». Набор эвристик:
+    team_home = ""
+    team_away = ""
 
-def split_russian_names(line: str) -> List[str]:
+    # пробуем по ключам
+    idx_comp = -1
+    keys = ["СОСТАВ КОМАНДЫ", "СОСТАВ", "СОСТАВЫ", "СОСТАВ КОМАНД"]
+    for i, ln in enumerate(head):
+        if any(k in ln.upper() for k in keys):
+            idx_comp = i
+            break
+
+    def looks_team(s: str) -> bool:
+        s2 = s.replace("Ё", "Е")
+        # длинные капс-строки на кириллице без лишних знаков
+        return (len(s2) >= 8) and (s2 == s2.upper()) and re.search(r"[А-Я]", s2)
+
+    candidates: List[str] = []
+    if idx_comp != -1:
+        # смотрим окно +-10 строк
+        lo = max(0, idx_comp - 10)
+        hi = min(len(head), idx_comp + 10)
+        for ln in head[lo:hi]:
+            if looks_team(ln):
+                candidates.append(ln)
+    else:
+        # fallback — возьмём первые 20 «капсовых» строк в шапке
+        for ln in head[:40]:
+            if looks_team(ln):
+                candidates.append(ln)
+
+    # оставим уникальные в порядке появления
+    seen = set()
+    uniq = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+
+    if len(uniq) >= 2:
+        # чаще всего первая — хозяева, вторая — гости
+        team_home, team_away = uniq[0], uniq[1]
+
+    doc.close()
+    return {
+        "date": date,
+        "time_msk": time_msk,
+        "teams": {"home": team_home, "away": team_away},
+    }
+
+# ------------------------------
+# OCR судьи (надёжный блок)
+# ------------------------------
+ROLE_WORDS = (
+    r"(Главн\w*\s+судья|Линейн\w*\s+судья|Резервн\w+(\s+главн\w+)?(\s+линейн\w+)?\s*судья)"
+)
+
+def ocr_refs_first_page(pdf_bytes: bytes, dpi: int = 300) -> Dict[str, Any]:
     """
-    Грубый сплит списка ФИО в одну строку.
-    Делим по шаблонам 'Фамилия Имя' + возможное Отчество.
+    Рендерим первую страницу, OCR rus+eng, вытаскиваем блок судей.
     """
-    # берём последовательности из 2–3 слов на кириллице с заглавной
-    tokens = re.findall(r"[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}", line)
-    return [normalize_spaces(x) for x in tokens]
+    t0 = time.time()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-@dataclass
-class ParsedRefs:
-    main: List[str]
-    linesmen: List[str]
-    raw_lines: List[str]
+    text = pytesseract.image_to_string(img, lang="rus+eng")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-def parse_referees_from_text(text: str) -> ParsedRefs:
-    """
-    Ищем блок судей. В PDF обычно есть строки из серии:
-      Главный судья ... Линейный судья ...
-      <список фамилий в одной строке>
-    """
-    lines = [normalize_spaces(x) for x in text.splitlines() if normalize_spaces(x)]
-    raw = []
-    main: List[str] = []
-    linesmen: List[str] = []
-
-    # 1) найдём строку с ролями
-    role_idx = None
+    # Найдём строку, где перечисляются роли, и следующую, где имена
+    # Часто встречается «Главный судья Главный судья Линейный судья Линейный судья»
+    roles_line_idx = -1
     for i, ln in enumerate(lines):
         if re.search(ROLE_WORDS, ln, flags=re.I):
-            role_idx = i
-            raw.append(ln)
+            roles_line_idx = i
             break
 
-    # 2) следующая(ие) строки — список фамилий
-    if role_idx is not None:
-        # соберём 1-2 следующие строки в пул
-        pool = []
-        for j in range(role_idx + 1, min(role_idx + 3, len(lines))):
-            if re.search(ROLE_WORDS, lines[j], flags=re.I):
-                # новая «шапка» — прекращаем
-                break
-            pool.append(lines[j])
-            raw.append(lines[j])
+    refs_main: List[str] = []
+    refs_lines: List[str] = []
+    raw_lines_dbg: List[str] = []
 
-        merged = " ".join(pool)
+    if roles_line_idx != -1:
+        # Имён обычно на следующей строке (иногда через одну)
+        name_line_idx = roles_line_idx + 1
+        if name_line_idx < len(lines):
+            raw_names = lines[name_line_idx]
+            raw_lines_dbg = [lines[roles_line_idx], raw_names]
+            # Разбиваем по пробелам и склеиваем парами Фамилия Имя
+            tokens = [t for t in re.split(r"[,\s]+", raw_names) if t]
+            # склейка «Фамилия Имя» — грубая, но эффективная
+            pairs: List[str] = []
+            buf = []
+            for t in tokens:
+                buf.append(t)
+                if len(buf) == 2:
+                    pairs.append(" ".join(buf))
+                    buf = []
+            # если не кратно двум — добрособираем
+            if buf:
+                pairs.append(" ".join(buf))
 
-        # распилим на имена
-        names = split_russian_names(merged)
+            # теперь распределим по ролям: 2 главных + 2 линейных обычно
+            # Сначала вытащим все роли (по словам 'Главн' и 'Линейн') из роли-строки:
+            role_counts = re.findall(r"(Главн\w+|Линейн\w+)", lines[roles_line_idx], flags=re.I)
+            # попытаемся раздать в порядке
+            m, l = [], []
+            idx = 0
+            for role in role_counts:
+                if idx >= len(pairs):
+                    break
+                if role.lower().startswith("главн"):
+                    m.append(pairs[idx])
+                else:
+                    l.append(pairs[idx])
+                idx += 1
+            # если не хватило — добрасываем остатками
+            while idx < len(pairs) and (len(m) < 2 or len(l) < 2):
+                (m if len(m) < 2 else l).append(pairs[idx])
+                idx += 1
 
-        # эвристика распределения: сначала идут 2 главных, затем 2 линейных (или 1 и 1)
-        # если нашли >= 4 — делим пополам 2+2; если 3 — 2 главных + 1 линейный; если 2 — 1+1, и т.д.
-        if len(names) >= 4:
-            main = names[:2]
-            linesmen = names[2:4]
-        elif len(names) == 3:
-            main = names[:2]
-            linesmen = names[2:]
-        elif len(names) == 2:
-            # чаще всего это главный + линейный (бывает не полная сетка)
-            main = [names[0]]
-            linesmen = [names[1]]
-        elif len(names) == 1:
-            # хоть что-то
-            main = [names[0]]
+            refs_main = m
+            refs_lines = l
 
-    return ParsedRefs(main=main, linesmen=linesmen, raw_lines=raw)
+    doc.close()
 
-def parse_meta_from_text(text: str) -> Dict[str, Any]:
-    """
-    Пытаемся вытащить дату/время и команды (верх PDF).
-    Это эвристики: мы берём первые ~30 строк и ловим
-    - ДАТА: 25.10.2025 (или 25.10.2025 19:00)
-    - Команды: две *большими* фразами (КИРИЛЛИЦА/КАПС)
-    """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    head = lines[:30]
+    # Чистим «Резервный …» и мусорные слова, нормализуем пробелы
+    def clean_name(s: str) -> str:
+        s = re.sub(r"\b(Резервн\w*|судья|судьи)\b", " ", s, flags=re.I)
+        s = re.sub(r"\s{2,}", " ", s).strip(" ,.;:")
+        # Случаи типа «Алексей Седов Егор» — оставим пары «Фамилия Имя»
+        # Если три токена — попробуем выбрать 2 «похожих» на ФИ:
+        toks = s.split()
+        if len(toks) >= 3:
+            # простая эвристика — возьмём первые два
+            s = " ".join(toks[:2])
+        return s
 
-    date_m = None
-    time_m = None
-    for ln in head:
-        m1 = re.search(DATE_RE, ln)
-        m2 = re.search(TIME_RE, ln)
-        if m1 and not date_m:
-            date_m = m1.group(1)
-        if m2 and not time_m:
-            t = m2.group(1).replace(".", ":")
-            if re.match(r"^\d{2}:\d{2}$", t):
-                time_m = t
-        if date_m and time_m:
-            break
+    refs_main = [clean_name(x) for x in refs_main if x]
+    refs_lines = [clean_name(x) for x in refs_lines if x]
 
-    # команды — две «громкие» строки (кириллица, ≥ 2 слова, много заглавных)
-    caps = []
-    for ln in head:
-        if re.search(r"[А-ЯЁ]{2,}", ln) and len(ln) >= 6 and "судья" not in ln.lower():
-            # фильтруем «обновлено», «главный судья» и т.д.
-            if re.search(ROLE_WORDS, ln, flags=re.I):
-                continue
-            caps.append(normalize_spaces(ln))
-    teams = []
-    # возьмём уникальные подрядные крупные строки
-    for c in caps:
-        if not teams or (teams and teams[-1] != c):
-            teams.append(c)
-        if len(teams) >= 2:
-            break
+    # финальный ремонт: убрать дубли и пустые
+    def uniq_keep(seq: List[str]) -> List[str]:
+        out, seen = [], set()
+        for x in seq:
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
 
-    meta = {
-        "date": date_m,
-        "time_msk": time_m,
-        "teams": {"home": teams[0] if len(teams) >= 1 else None,
-                  "away": teams[1] if len(teams) >= 2 else None},
+    refs_main = uniq_keep(refs_main)
+    refs_lines = uniq_keep(refs_lines)
+
+    return {
+        "main": refs_main,
+        "linesmen": refs_lines,
+        "_raw_lines": raw_lines_dbg,
+        "_duration_s": round(time.time() - t0, 3),
     }
-    return meta
 
-# ------------ Endpoint ------------
+# ------------------------------
+# Flask endpoints
+# ------------------------------
+@app.route("/health")
+def health():
+    return j({"ok": True, "engine": "ready"})
 
 @app.route("/extract")
 def extract():
+    season = (request.args.get("season") or "").strip()
+    uid = (request.args.get("uid") or "").strip()
+    mode = (request.args.get("mode") or "refs").strip().lower()
+    debug = request.args.get("debug", "0") in ("1", "true", "yes")
+
+    if not season or not uid:
+        return j({"ok": False, "error": "params required: season, uid"}, 400)
+
+    url = build_pdf_url(season, uid)
     t0 = time.time()
-    season = request.args.get("season", "").strip()
-    uid = request.args.get("uid", "").strip()
-    mode = (request.args.get("mode", "refs")).strip().lower()
-
-    if not (season and uid):
-        return jsonify({"ok": False, "error": "params 'season' and 'uid' required"}), 400
-
     try:
-        pdf_bytes, src = load_pdf_bytes(season, uid)
+        pdf_bytes = fetch_pdf_bytes(season, uid)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
+        return j({"ok": False, "error": f"http fetch failed: {e}"}, 502)
 
-    # сейчас реализуем refs (+ meta). words/goalies можно докинуть позже.
-    if mode not in ("refs", "all"):
-        return jsonify({"ok": False, "error": "mode must be 'refs' or 'all' (refs supported now)"}), 400
+    out: Dict[str, Any] = {"ok": True, "source_url": url}
 
-    try:
-        text = extract_text_pages(pdf_bytes, max_pages=2)
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"text-extract failed: {e}", "source_url": src}), 500
+    # words: матч-мета
+    if mode in ("words", "all"):
+        try:
+            meta = parse_match_meta_words(pdf_bytes)
+            out.setdefault("match", {"season": season, "uid": uid})
+            out["match"].update(meta)
+            out["engine"] = "words" if mode == "words" else out.get("engine", "all")
+        except Exception as e:
+            out.setdefault("warnings", []).append(f"words-meta: {e}")
 
-    refs = parse_referees_from_text(text)
-    meta = parse_meta_from_text(text)
+    # refs: судьи
+    if mode in ("refs", "all"):
+        try:
+            refs = ocr_refs_first_page(pdf_bytes, dpi=300)
+            out["referees"] = {"main": refs["main"], "linesmen": refs["linesmen"]}
+            out["engine"] = "ocr-refs" if mode == "refs" else out.get("engine", "all")
+            if debug:
+                out["_debug"] = {"raw_lines": refs.get("_raw_lines", [])}
+        except Exception as e:
+            return j({"ok": False, "error": f"ocr-refs failed: {e}"}, 500)
 
-    out: Dict[str, Any] = {
-        "ok": True,
-        "engine": "words-refs",
-        "duration_s": round(time.time() - t0, 3),
-        "source_url": src,
-        "match": {
-            "season": season,
-            "uid": uid,
-            "date": meta.get("date"),
-            "time_msk": meta.get("time_msk"),
-            "teams": meta.get("teams"),
-        },
-        "referees": {
-            "main": refs.main,
-            "linesmen": refs.linesmen,
-        },
-        "_debug": {
-            "raw_lines": refs.raw_lines
-        }
-    }
-    return jsonify(out)
+    # только refs?
+    if mode == "refs":
+        pass
+    elif mode == "words":
+        out.setdefault("match", {"season": season, "uid": uid})
+    elif mode == "all":
+        out.setdefault("match", {"season": season, "uid": uid})
+    else:
+        return j({"ok": False, "error": "mode must be refs|words|all"}, 400)
 
-# ------------ Local run ------------
+    out["duration_s"] = round(time.time() - t0, 3)
+    return j(out)
+
+# ------------------------------
+# gunicorn entrypoint
+# ------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # для локального запуска: python app.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
