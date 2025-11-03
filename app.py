@@ -82,82 +82,79 @@ def fetch_pdf_bytes(season: str, uid: str) -> bytes:
 # ------------------------------
 # Извлечение МЕТА (date/time/teams) через words
 # ------------------------------
-RE_DATE = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
-RE_TIME = re.compile(r"\b([01]\d|2[0-3]):[0-5]\d\b")
+RE_DATE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
+RE_TIME = re.compile(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b")  # захватываем ВСЮ HH:MM
 
 def parse_match_meta_words(pdf_bytes: bytes) -> Dict[str, Any]:
     """
-    Извлекаем быстрой «текстовой» выборкой:
-    - teams (две верхние «капсом» строки около шапки)
-    - date/time_msk (любые первые встреченные в верхней половине)
-    Сильно упрощённо, но на твоих протоколах даёт стабильный результат.
+    Быстрый парс шапки: дата, время (HH:MM), команды (капсом).
+    Эвристики:
+      - выбираем время по полному совпадению HH:MM
+      - по датам берём с годом >= 2024; если найдено несколько — первую по порядку
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
-    # берем полный текст и первые 80 строк — этого хватает
-    full_text = page.get_text("text")
-    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-    head = lines[:80]
+    text = page.get_text("text")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    head = lines[:120]  # окно шапки побольше — иногда «СОСТАВ» ниже
 
-    # Дата/время
-    date = ""
+    # ---- ВРЕМЯ HH:MM (берём ПОЛНОЕ совпадение) ----
     time_msk = ""
     for ln in head:
-        if not date:
-            m = RE_DATE.search(ln)
-            if m:
-                date = m.group(1)
-        if not time_msk:
-            m = RE_TIME.search(ln)
-            if m:
-                time_msk = m.group(1)
-        if date and time_msk:
+        m = RE_TIME.search(ln)
+        if m:
+            time_msk = m.group(0)  # ВАЖНО: вся строка HH:MM
             break
 
-    # Команды: ищем две длинные UPPERCASE-строки рядом со словом «СОСТАВ»
-    # или рядом с «Гости/Хозяева». Набор эвристик:
-    team_home = ""
-    team_away = ""
+    # ---- ДАТА с фильтром по году ----
+    date = ""
+    for ln in head:
+        m = RE_DATE.search(ln)
+        if not m:
+            continue
+        cand = m.group(1)
+        try:
+            yy = int(cand.split(".")[2])
+        except Exception:
+            yy = 0
+        if yy >= 2024:
+            date = cand
+            break
 
-    # пробуем по ключам
+    # ---- КОМАНДЫ (капсом) ----
+    def looks_team(s: str) -> bool:
+        s2 = s.replace("Ё", "Е")
+        return (len(s2) >= 8) and (s2 == s2.upper()) and re.search(r"[А-Я]", s2)
+
+    # находим ближайшие капс-строки вокруг слова «СОСТАВ»
     idx_comp = -1
-    keys = ["СОСТАВ КОМАНДЫ", "СОСТАВ", "СОСТАВЫ", "СОСТАВ КОМАНД"]
+    keys = ("СОСТАВ КОМАНДЫ", "СОСТАВ", "СОСТАВЫ", "СОСТАВ КОМАНД")
     for i, ln in enumerate(head):
         if any(k in ln.upper() for k in keys):
             idx_comp = i
             break
 
-    def looks_team(s: str) -> bool:
-        s2 = s.replace("Ё", "Е")
-        # длинные капс-строки на кириллице без лишних знаков
-        return (len(s2) >= 8) and (s2 == s2.upper()) and re.search(r"[А-Я]", s2)
-
-    candidates: List[str] = []
+    candidates = []
     if idx_comp != -1:
-        # смотрим окно +-10 строк
-        lo = max(0, idx_comp - 10)
-        hi = min(len(head), idx_comp + 10)
+        lo = max(0, idx_comp - 12)
+        hi = min(len(head), idx_comp + 12)
         for ln in head[lo:hi]:
             if looks_team(ln):
                 candidates.append(ln)
     else:
-        # fallback — возьмём первые 20 «капсовых» строк в шапке
-        for ln in head[:40]:
+        for ln in head[:60]:
             if looks_team(ln):
                 candidates.append(ln)
 
-    # оставим уникальные в порядке появления
-    seen = set()
-    uniq = []
+    seen, uniq = set(), []
     for c in candidates:
         if c not in seen:
             seen.add(c)
             uniq.append(c)
 
-    if len(uniq) >= 2:
-        # чаще всего первая — хозяева, вторая — гости
-        team_home, team_away = uniq[0], uniq[1]
+    team_home = uniq[0] if len(uniq) >= 1 else ""
+    team_away = uniq[1] if len(uniq) >= 2 else ""
 
     doc.close()
     return {
@@ -302,37 +299,35 @@ def extract():
     except Exception as e:
         return j({"ok": False, "error": f"http fetch failed: {e}"}, 502)
 
-    out: Dict[str, Any] = {"ok": True, "source_url": url}
+    out: Dict[str, Any] = {"ok": True, "source_url": url, "engine": None}
+    warnings: List[str] = []
 
-    # words: матч-мета
-    if mode in ("words", "all"):
+    do_words = mode in ("words", "all")
+    do_refs  = mode in ("refs", "all")
+
+    if do_words:
         try:
             meta = parse_match_meta_words(pdf_bytes)
             out.setdefault("match", {"season": season, "uid": uid})
             out["match"].update(meta)
-            out["engine"] = "words" if mode == "words" else out.get("engine", "all")
+            out["engine"] = "words" if mode == "words" else "all"
         except Exception as e:
-            out.setdefault("warnings", []).append(f"words-meta: {e}")
+            warnings.append(f"words-meta: {e}")
 
-    # refs: судьи
-    if mode in ("refs", "all"):
+    if do_refs:
         try:
             refs = ocr_refs_first_page(pdf_bytes, dpi=300)
             out["referees"] = {"main": refs["main"], "linesmen": refs["linesmen"]}
-            out["engine"] = "ocr-refs" if mode == "refs" else out.get("engine", "all")
             if debug:
                 out["_debug"] = {"raw_lines": refs.get("_raw_lines", [])}
+            out["engine"] = "ocr-refs" if mode == "refs" else "all"
         except Exception as e:
-            return j({"ok": False, "error": f"ocr-refs failed: {e}"}, 500)
+            warnings.append(f"ocr-refs: {e}")
 
-    # только refs?
-    if mode == "refs":
-        pass
-    elif mode == "words":
-        out.setdefault("match", {"season": season, "uid": uid})
-    elif mode == "all":
-        out.setdefault("match", {"season": season, "uid": uid})
-    else:
+    if warnings:
+        out["warnings"] = warnings
+
+    if not out.get("engine"):
         return j({"ok": False, "error": "mode must be refs|words|all"}, 400)
 
     out["duration_s"] = round(time.time() - t0, 3)
