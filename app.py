@@ -326,39 +326,53 @@ def extract():
 
     t0 = time.time()
     try:
-        pdf_bytes, used_url = fetch_pdf_bytes(season, uid)
+        # 1) PDF
+        try:
+            pdf_bytes, used_url = fetch_pdf_bytes(season, uid)
+        except Exception as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            return jsonify({"ok": False, "stage":"fetch_pdf", "error": f"http {code or 'error'}", "detail": str(e)}), 502
+
+        # 2) Базовый разбор страниц (может бросать исключения PyMuPDF)
+        try:
+            lines_data, meta, all_lines = parse_lines(pdf_bytes)
+        except Exception as e:
+            return jsonify({"ok": False, "stage":"parse_lines", "error":"parse-failed", "detail": str(e)}), 200
+
+        result = {
+            "ok": True,
+            "engine": "words",
+            "season": season,
+            "uid": uid,
+            "meta": {
+                "date": meta.get("date"),
+                "time": meta.get("time"),
+                "home": meta.get("home"),
+                "away": meta.get("away"),
+            },
+            "data": lines_data,
+            "referees": {"main": [], "linesmen": []},
+            "source_url": used_url,
+        }
+
+        # 3) Судьи (words → ocr fallback), тоже защищаем
+        if mode in ("refs", "all"):
+            try:
+                refs, eng, _dur = parse_referees(pdf_bytes, all_lines, want_debug=debug)
+                result["referees"] = refs
+                result["engine"] = eng
+            except Exception as e:
+                result["referees"] = {"main": [], "linesmen": [], "_error": str(e)}
+
+        if debug:
+            result["_debug"] = {"lines_sample": all_lines[:80]}
+
+        result["duration_s"] = round(time.time() - t0, 3)
+        return jsonify(result)
+
     except Exception as e:
-        return jsonify({"ok": False, "error": f"http {getattr(e, 'response', None) and e.response.status_code or 'err'}"}), 502
-
-    # базовый разбор линий/меты (нужен большинству режимов)
-    lines_data, meta, all_lines = parse_lines(pdf_bytes)
-
-    result = {
-        "ok": True,
-        "engine": "words",
-        "season": season,
-        "uid": uid,
-        "meta": {
-            "date": meta.get("date"),
-            "time": meta.get("time"),
-            "home": meta.get("home"),
-            "away": meta.get("away"),
-        },
-        "data": lines_data,
-        "referees": {"main": [], "linesmen": []},
-        "source_url": used_url,
-    }
-
-    if mode in ("refs", "all"):
-        refs, eng, dur = parse_referees(pdf_bytes, all_lines, want_debug=debug)
-        result["referees"] = refs
-        result["engine"] = eng
-
-    if debug:
-        result["_debug"] = {"lines_sample": all_lines[:80]}
-
-    result["duration_s"] = round(time.time() - t0, 3)
-    return jsonify(result)
+        # Любой неожиданный крэш – отдадим JSON, а не 502
+        return jsonify({"ok": False, "stage": "fatal", "error": type(e).__name__, "detail": str(e)}), 200
 
 
 if __name__ == "__main__":
